@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="utss-dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>UTSS Universal Language Analysis & Synthesis Workbench</title>
+    <!-- Prevent FOUC by reading saved theme before render -->
+    <script>
+      (function() {
+        try {
+          const savedTheme = localStorage.getItem("utss_workbench_theme");
+          if (savedTheme) {
+            document.documentElement.setAttribute("data-theme", savedTheme);
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <script type="module" crossorigin src="/static/assets/index-BpSZTzOv.js"></script>
+    <link rel="stylesheet" crossorigin href="/static/assets/index-CFPIrX2p.css">
+  </head>
+  <body>
+    <div id="root">
+      <noscript>
+        <div id="db-select"></div>
+        <div id="sql-editor"></div>
+        <div id="results-table"></div>
+      </noscript>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/UTSS.CSharp/UTSS.CSharp.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/UTSS.CSharp.Tests/UTSS.CSharp.Tests.csproj" />
+  </Folder>
+</Solution>

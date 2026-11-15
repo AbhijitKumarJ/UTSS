@@ -1,0 +1,23 @@
+{
+  "name": "utss-ts",
+  "version": "0.1.0",
+  "description": "Universal Type & Symbol System (UTSS) TypeScript Cataloger",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "utss-ts": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --no-warnings dist/cli.js",
+    "test": "node --no-warnings --test dist/tests/integration.test.js"
+  },
+  "dependencies": {
+    "typescript": "^5.7.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.1"
+  }
+}

@@ -1,0 +1,98 @@
+/* Theme Token Definitions for UTSS Workbench */
+
+:root,
+[data-theme="utss-dark"] {
+  --bg-main: #0b0f19;
+  --bg-surface: #111827;
+  --bg-card: #1f2937;
+  --bg-hover: #374151;
+  --border-color: #374151;
+  --border-subtle: #2d3748;
+  --editor-bg: #0d1117;
+  --line-numbers-bg: #090d13;
+  
+  --text-primary: #f9fafb;
+  --text-secondary: #9ca3af;
+  --text-muted: #6b7280;
+  
+  --accent-primary: #3b82f6;
+  --accent-primary-hover: #2563eb;
+  --accent-cyan: #06b6d4;
+  --accent-green: #10b981;
+  --accent-amber: #f59e0b;
+  --accent-rose: #f43f5e;
+  
+  color-scheme: dark;
+}
+
+[data-theme="vscode-dark"] {
+  --bg-main: #181818;
+  --bg-surface: #252526;
+  --bg-card: #2d2d2d;
+  --bg-hover: #3c3c3c;
+  --border-color: #3c3c3c;
+  --border-subtle: #333333;
+  --editor-bg: #1e1e1e;
+  --line-numbers-bg: #1e1e1e;
+  
+  --text-primary: #cccccc;
+  --text-secondary: #969696;
+  --text-muted: #6e6e6e;
+  
+  --accent-primary: #007acc;
+  --accent-primary-hover: #0098ff;
+  --accent-cyan: #4ec9b0;
+  --accent-green: #6a9955;
+  --accent-amber: #ce9178;
+  --accent-rose: #f14c4c;
+  
+  color-scheme: dark;
+}
+
+[data-theme="vscode-light"] {
+  --bg-main: #f3f3f3;
+  --bg-surface: #ffffff;
+  --bg-card: #f8f8f8;
+  --bg-hover: #e8e8e8;
+  --border-color: #e5e5e5;
+  --border-subtle: #eaeaea;
+  --editor-bg: #ffffff;
+  --line-numbers-bg: #fafafa;
+  
+  --text-primary: #333333;
+  --text-secondary: #666666;
+  --text-muted: #888888;
+  
+  --accent-primary: #007acc;
+  --accent-primary-hover: #005a9e;
+  --accent-cyan: #00709b;
+  --accent-green: #008000;
+  --accent-amber: #a31515;
+  --accent-rose: #cd3131;
+  
+  color-scheme: light;
+}
+
+[data-theme="monokai"] {
+  --bg-main: #1e1f1c;
+  --bg-surface: #272822;
+  --bg-card: #3e3d32;
+  --bg-hover: #49483e;
+  --border-color: #49483e;
+  --border-subtle: #383830;
+  --editor-bg: #272822;
+  --line-numbers-bg: #272822;
+  
+  --text-primary: #f8f8f2;
+  --text-secondary: #cfcfc2;
+  --text-muted: #75715e;
+  
+  --accent-primary: #fd971f;
+  --accent-primary-hover: #e68512;
+  --accent-cyan: #66d9ef;
+  --accent-green: #a6e22e;
+  --accent-amber: #e6db74;
+  --accent-rose: #f92672;
+  
+  color-scheme: dark;
+}

@@ -1,0 +1,19 @@
+[project]
+name = "utss-workbench"
+version = "0.1.0"
+description = "UTSS Central Analysis, Bridge, and Transpilation Workbench Backend"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "pydantic>=2.8.0",
+    "duckdb>=1.0.0",
+    "pandas>=2.2.0",
+    "sqlite-utils>=3.36",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,3040 @@
+#!/usr/bin/env python3
+"""
+python_spectrum_harvester.py
+
+Standalone, zero-dependency clean-room cataloger for the complete Python spectrum:
+  - Pass 1 (Stratum 0): Ambient Scope (No-import keywords, builtins, site-builtins, module dunders)
+  - Pass 2 (Stratum 1): Versioned Python Stdlib (Built-in C, Frozen, Pure-Python, C-Extensions,
+                        both public and hidden `_` modules/functions/variables)
+  - Pass 3 (Stratum 2): Environment Third-Party Distributions (via importlib.metadata)
+  - Pass 4 (Static .pyi Overlay): AST-based Typeshed `.pyi` overlay that enriches opaque C-builtins,
+                        attaches static parameter/return types, and populates `@overload` sets.
+  - Pass 5 (Stratum 3): Local Project/Workspace Pure-AST Harvester (`WorkspaceAstCataloger`)
+                        that scans a user's `.py` codebase without importing or executing code.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import builtins
+import hashlib
+import importlib
+import importlib.machinery
+import importlib.metadata
+import importlib.util
+import inspect
+import json
+import keyword
+import platform
+import pkgutil
+import sqlite3
+import subprocess
+import sys
+import sysconfig
+import tempfile
+import types
+from pathlib import Path
+from typing import Any, Sequence
+
+
+SIDE_EFFECT_STDLIB_MODULES: frozenset[str] = frozenset({
+    "antigravity",
+    "this",
+    "idlelib",
+    "tkinter",
+    "turtle",
+    "turtledemo",
+    "test",
+    "lib2to3",
+    "ensurepip",
+    "venv",
+    "pydoc_data",
+    "__hello__",
+    "__phello__",
+    "_xxsubinterpreters",
+    "_xxinterpchannels",
+    "_xxtestfuzz",
+})
+
+WORKSPACE_IGNORED_DIRS: frozenset[str] = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    "node_modules",
+    "build",
+    "dist",
+    ".eggs",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+})
+
+IMPLICIT_MODULE_DUNDERS: tuple[tuple[str, str, str], ...] = (
+    ("__name__", "str", "Module's runtime name ('__main__' when executed directly, or dotted module name)."),
+    ("__doc__", "str | None", "Module's top-level docstring literal, or None if absent."),
+    ("__package__", "str | None", "Parent package name used to resolve relative imports."),
+    ("__loader__", "Loader | None", "The importlib Loader object that loaded this module."),
+    ("__spec__", "ModuleSpec | None", "The importlib ModuleSpec describing module import state and origin."),
+    ("__file__", "str | None", "Filesystem path from which the module was loaded (absent on some built-in C modules)."),
+    ("__cached__", "str | None", "Filesystem path to the compiled bytecode (.pyc) file."),
+    ("__builtins__", "dict[str, Any] | module", "Reference to the ambient builtins module or its namespace dictionary."),
+    ("__annotations__", "dict[str, Any]", "Module-level variable type annotations dictionary."),
+)
+
+EMBEDDED_DEMO_STUBS: dict[str, str] = {
+    "builtins": """
+from typing import Any, Callable, Iterable, Sequence, Sized, TypeVar, overload
+import io
+
+_T = TypeVar("_T")
+
+def len(obj: Sized, /) -> int: ...
+def print(
+    *values: object,
+    sep: str | None = " ",
+    end: str | None = "\\n",
+    file: Any | None = None,
+    flush: bool = False,
+) -> None: ...
+
+@overload
+def open(
+    file: str | bytes | int,
+    mode: str = "r",
+    buffering: int = -1,
+    encoding: str | None = None,
+) -> io.TextIOWrapper: ...
+@overload
+def open(
+    file: str | bytes | int,
+    mode: bytes,
+    buffering: int = -1,
+    encoding: None = None,
+) -> io.BufferedRandom | io.BufferedReader | io.BufferedWriter: ...
+
+@overload
+def max(arg1: _T, arg2: _T, *_args: _T, key: Callable[[_T], Any] | None = None) -> _T: ...
+@overload
+def max(iterable: Iterable[_T], *, key: Callable[[_T], Any] | None = None) -> _T: ...
+""",
+    "sys": """
+import sys
+from typing import Any, NoReturn, TextIO
+
+argv: list[str]
+executable: str
+platform: str
+version: str
+modules: dict[str, Any]
+path: list[str]
+stdin: TextIO
+stdout: TextIO
+stderr: TextIO
+
+def exit(status: str | int | None = None, /) -> NoReturn: ...
+""",
+    "os": """
+from typing import Callable, Iterator, MutableMapping, overload
+
+environ: MutableMapping[str, str]
+sep: str
+name: str
+
+def getcwd() -> str: ...
+def listdir(path: str | bytes | None = None) -> list[str]: ...
+
+@overload
+def getenv(key: str) -> str | None: ...
+@overload
+def getenv(key: str, default: str) -> str: ...
+""",
+}
+
+# Embedded multi-file workspace fixtures used when `--demo-workspace` is passed
+EMBEDDED_DEMO_WORKSPACE_FILES: dict[str, str] = {
+    "src/commerce_engine/__init__.py": '''
+"""Top-level Commerce Engine package."""
+from .models import Order, OrderStatus, CustomerId
+from .service import OrderProcessor, stream_orders
+
+__all__ = ["Order", "OrderStatus", "CustomerId", "OrderProcessor", "stream_orders"]
+__version__ = "0.4.0"
+''',
+    "src/commerce_engine/models.py": '''
+"""Domain models and type aliases for Commerce Engine."""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from decimal import Decimal
+
+type CustomerId = int
+DEFAULT_CURRENCY: str = "USD"
+_INTERNAL_TAX_RATE = 0.0825
+
+class OrderStatus:
+    PENDING: str = "pending"
+    PAID: str = "paid"
+    CANCELLED: str = "cancelled"
+
+class Order:
+    """Represents a customer order with instance attributes initialized in __init__."""
+    registry_count: int = 0
+
+    def __init__(self, order_id: str, customer_id: CustomerId, subtotal: float = 0.0) -> None:
+        self.order_id = order_id
+        self.customer_id = customer_id
+        self.subtotal = subtotal
+        self.status: str = OrderStatus.PENDING
+        self._audit_trail: list[str] = []
+        self.__secret_token = "tok_live_99"
+
+    @property
+    def total_with_tax(self) -> float:
+        return self.subtotal * (1.0 + _INTERNAL_TAX_RATE)
+
+    @staticmethod
+    def validate_id(raw_id: str) -> bool:
+        return bool(raw_id and raw_id.startswith("ord_"))
+''',
+    "src/commerce_engine/service.py": '''
+"""Order processing service with overloads, async methods, and generators."""
+from __future__ import annotations
+import json
+import os
+from typing import AsyncIterator, Iterator, overload
+from .models import Order, OrderStatus, DEFAULT_CURRENCY
+from . import _internal_metrics as metrics
+
+__all__ = ["OrderProcessor", "stream_orders"]
+
+class ProcessingError(RuntimeError):
+    """Raised when an order cannot be processed."""
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+class OrderProcessor:
+    def __init__(self, region: str = "IN-WB", max_retries: int = 3) -> None:
+        self.region = region
+        self.max_retries = max_retries
+        self.currency = DEFAULT_CURRENCY
+        self._processed_ids: set[str] = set()
+
+    @overload
+    def serialize(self, order: Order, *, as_bytes: bool = False) -> str: ...
+    @overload
+    def serialize(self, order: list[Order], *, as_bytes: bool = False) -> list[str]: ...
+    def serialize(self, order: Order | list[Order], *, as_bytes: bool = False) -> str | list[str]:
+        if isinstance(order, list):
+            return [json.dumps({"id": o.order_id, "status": o.status}) for o in order]
+        return json.dumps({"id": order.order_id, "status": order.status})
+
+    async def submit_async(self, order: Order) -> bool:
+        metrics._increment_counter("submitted")
+        order.status = OrderStatus.PAID
+        self._processed_ids.add(order.order_id)
+        return True
+
+def stream_orders(batch: list[Order]) -> Iterator[Order]:
+    """Generator function detected statically via ast.Yield."""
+    for item in batch:
+        if item.status != OrderStatus.CANCELLED:
+            yield item
+
+async def watch_events(channel: str) -> AsyncIterator[dict[str, str]]:
+    """Async generator function detected statically via AsyncFunctionDef + ast.Yield."""
+    yield {"channel": channel, "env": os.getenv("APP_ENV", "dev")}
+''',
+    "src/commerce_engine/_internal_metrics.py": '''
+"""Private telemetry helper module."""
+_COUNTERS: dict[str, int] = {}
+
+def _increment_counter(name: str, delta: int = 1) -> int:
+    _COUNTERS[name] = _COUNTERS.get(name, 0) + delta
+    return _COUNTERS[name]
+''',
+    "cli_runner.py": '''
+"""Top-level workspace CLI entrypoint script."""
+import sys
+from commerce_engine import Order, OrderProcessor
+
+def main(argv: list[str] | None = None) -> int:
+    args = argv if argv is not None else sys.argv[1:]
+    proc = OrderProcessor(region="IN-KOL")
+    sample = Order("ord_101", 42, subtotal=250.0)
+    print(proc.serialize(sample), len(args))
+    return 0
+
+if __name__ == "__main__":
+    EXIT_CODE: int = main()
+    sys.exit(EXIT_CODE)
+''',
+}
+
+
+# ============================================================================
+# 1. LANGUAGE-AGNOSTIC CORE + PYTHON FACET SQLITE SCHEMA
+# ============================================================================
+
+SCHEMA_SQL = """
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+
+-- 1. Environments: Tracks exact language runtime versions & platforms
+CREATE TABLE IF NOT EXISTS environments (
+    env_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    language TEXT NOT NULL,                 -- 'python', 'rust', 'csharp', 'typescript'
+    runtime_name TEXT NOT NULL,             -- 'CPython', 'PyPy', 'rustc', '.NET'
+    language_version TEXT NOT NULL,         -- e.g. '3.12.7'
+    version_major INTEGER NOT NULL,
+    version_minor INTEGER NOT NULL,
+    version_micro INTEGER NOT NULL,
+    platform_triplet TEXT NOT NULL,         -- e.g. 'Linux-x86_64'
+    sys_platform TEXT NOT NULL,             -- e.g. 'linux', 'darwin', 'win32'
+    executable_path TEXT NOT NULL,
+    captured_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(language, runtime_name, language_version, platform_triplet, executable_path)
+);
+
+-- 2. Distributions: Logical deliverable units (0=Ambient, 1=Stdlib, 2=Third-Party, 3=Workspace)
+CREATE TABLE IF NOT EXISTS distributions (
+    dist_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    env_id INTEGER NOT NULL REFERENCES environments(env_id) ON DELETE CASCADE,
+    stratum INTEGER NOT NULL,               -- 0 = Ambient, 1 = Stdlib, 2 = Third-Party, 3 = Workspace
+    dist_name TEXT NOT NULL,                -- '<ambient>', 'python-stdlib', 'numpy', or workspace project name
+    dist_version TEXT NOT NULL,
+    summary TEXT,
+    UNIQUE(env_id, stratum, dist_name, dist_version)
+);
+
+-- 3. Containers: Universal hierarchy (ambient_scope, package, module, class, exception_class)
+CREATE TABLE IF NOT EXISTS containers (
+    container_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dist_id INTEGER NOT NULL REFERENCES distributions(dist_id) ON DELETE CASCADE,
+    parent_container_id INTEGER REFERENCES containers(container_id) ON DELETE CASCADE,
+    container_kind TEXT NOT NULL,           -- 'ambient_scope', 'package', 'module', 'class', 'exception_class'
+    qualified_name TEXT NOT NULL,
+    short_name TEXT NOT NULL,
+    requires_import INTEGER NOT NULL DEFAULT 1,
+    visibility TEXT NOT NULL,               -- 'public', 'hidden_internal', 'private_mangled', 'system_dunder'
+    is_hidden INTEGER NOT NULL DEFAULT 0,
+    physical_path TEXT,
+    stub_path TEXT,
+    sha256_hash TEXT,
+    start_line INTEGER,
+    start_col INTEGER,
+    end_line INTEGER,
+    end_col INTEGER,
+    docstring TEXT,
+    UNIQUE(dist_id, qualified_name)
+);
+
+-- 4. Symbols: Master language-agnostic directory of every callable, variable, constant, property, or keyword
+CREATE TABLE IF NOT EXISTS symbols (
+    symbol_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    container_id INTEGER NOT NULL REFERENCES containers(container_id) ON DELETE CASCADE,
+    origin_container_id INTEGER REFERENCES containers(container_id),
+    name TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    symbol_kind TEXT NOT NULL,              -- 'keyword', 'soft_keyword', 'function', 'method', 'constructor',
+                                            -- 'class', 'exception', 'constant', 'variable', 'property', 'type_alias'
+    visibility TEXT NOT NULL,               -- 'exported_all', 'public_implicit', 'hidden_internal',
+                                            -- 'private_mangled', 'system_dunder'
+    provenance TEXT NOT NULL,               -- 'defined_here', 're_exported', 'site_injected', 'implicit_dunder',
+                                            -- 'pyi_stub_only', 'pyi_enriched', 'ast_defined', 'ast_init_attribute',
+                                            -- 'ast_type_checking_only', 'ast_main_guard'
+    is_hidden INTEGER NOT NULL DEFAULT 0,
+    start_line INTEGER,
+    start_col INTEGER,
+    end_line INTEGER,
+    end_col INTEGER,
+    docstring TEXT,
+    UNIQUE(container_id, name)
+);
+
+-- 5. Callables: Universal primary signature & execution modifiers
+CREATE TABLE IF NOT EXISTS callables (
+    symbol_id INTEGER PRIMARY KEY REFERENCES symbols(symbol_id) ON DELETE CASCADE,
+    is_async INTEGER NOT NULL DEFAULT 0,
+    is_generator INTEGER NOT NULL DEFAULT 0,
+    is_static INTEGER NOT NULL DEFAULT 0,
+    is_class_bound INTEGER NOT NULL DEFAULT 0,
+    has_overloads INTEGER NOT NULL DEFAULT 0,
+    overload_count INTEGER NOT NULL DEFAULT 0,
+    type_params_json TEXT,
+    return_type_expr TEXT,
+    raw_signature TEXT,
+    signature_source TEXT NOT NULL          -- 'inspect_signature', 'text_signature', 'docstring_first_line',
+                                            -- 'pyi_stub_overlay', 'pyi_overload_overlay', 'ast_source',
+                                            -- 'ast_overload_source', 'unknown'
+);
+
+-- 6. Callable Overloads: Stores 1..N static @overload signatures per callable
+CREATE TABLE IF NOT EXISTS callable_overloads (
+    overload_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    callable_symbol_id INTEGER NOT NULL REFERENCES callables(symbol_id) ON DELETE CASCADE,
+    overload_ordinal INTEGER NOT NULL,
+    type_params_json TEXT,
+    return_type_expr TEXT,
+    raw_signature TEXT NOT NULL,
+    UNIQUE(callable_symbol_id, overload_ordinal)
+);
+
+-- 7. Parameters: Ordered parameter list for primary callables (overload_id IS NULL) and @overload variants
+CREATE TABLE IF NOT EXISTS parameters (
+    param_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    callable_symbol_id INTEGER NOT NULL REFERENCES callables(symbol_id) ON DELETE CASCADE,
+    overload_id INTEGER REFERENCES callable_overloads(overload_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    pass_kind TEXT NOT NULL,                -- 'positional_only', 'positional_or_keyword', 'var_positional',
+                                            -- 'keyword_only', 'var_keyword'
+    type_expr TEXT,
+    type_source TEXT,                       -- 'runtime_annotation', 'pyi_stub', 'ast_annotation', NULL
+    default_expr TEXT,
+    is_optional INTEGER NOT NULL DEFAULT 0
+);
+
+-- 8. State Members: Ambient constants, module globals, class variables, instance attributes, and properties
+CREATE TABLE IF NOT EXISTS state_members (
+    symbol_id INTEGER PRIMARY KEY REFERENCES symbols(symbol_id) ON DELETE CASCADE,
+    declared_type_expr TEXT,
+    runtime_type_name TEXT NOT NULL,
+    is_constant INTEGER NOT NULL DEFAULT 0,
+    is_mutable INTEGER NOT NULL DEFAULT 1,
+    literal_value_repr TEXT,
+    access_mode TEXT NOT NULL DEFAULT 'read_write'
+);
+
+-- 9. Symbol Aliases & Re-exports: Cross-module re-exports and workspace import edges
+CREATE TABLE IF NOT EXISTS symbol_aliases (
+    alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_container_id INTEGER NOT NULL REFERENCES containers(container_id) ON DELETE CASCADE,
+    exposed_name TEXT NOT NULL,
+    target_module_name TEXT NOT NULL,
+    target_symbol_name TEXT NOT NULL,
+    alias_kind TEXT NOT NULL,               -- 'c_accelerator_reexport', 'explicit_all_reexport',
+                                            -- 'imported_module_ref', 'imported_symbol_ref',
+                                            -- 'workspace_import', 'workspace_relative_import', 'wildcard_import'
+    is_in_dunder_all INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(source_container_id, exposed_name)
+);
+
+-- 10. Python Container Facets
+CREATE TABLE IF NOT EXISTS py_container_facets (
+    container_id INTEGER PRIMARY KEY REFERENCES containers(container_id) ON DELETE CASCADE,
+    module_origin_kind TEXT,                -- 'ambient', 'builtin_c', 'frozen', 'pure_python', 'c_extension',
+                                            -- 'namespace_pkg', 'class_body', 'workspace_py', 'workspace_script'
+    has_dunder_all INTEGER NOT NULL DEFAULT 0,
+    dunder_all_json TEXT,
+    has_lazy_getattr INTEGER NOT NULL DEFAULT 0,
+    base_classes_json TEXT,
+    mro_json TEXT,
+    metaclass_name TEXT
+);
+
+-- 11. Python Symbol Facets
+CREATE TABLE IF NOT EXISTS py_symbol_facets (
+    symbol_id INTEGER PRIMARY KEY REFERENCES symbols(symbol_id) ON DELETE CASCADE,
+    py_runtime_type TEXT NOT NULL,
+    descriptor_kind TEXT,
+    is_c_implemented INTEGER NOT NULL DEFAULT 0,
+    co_flags INTEGER,
+    dunder_category TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_containers_qname ON containers(qualified_name);
+CREATE INDEX IF NOT EXISTS idx_symbols_qname ON symbols(qualified_name);
+CREATE INDEX IF NOT EXISTS idx_symbols_container_name ON symbols(container_id, name);
+CREATE INDEX IF NOT EXISTS idx_params_callable ON parameters(callable_symbol_id, overload_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_overloads_callable ON callable_overloads(callable_symbol_id, overload_ordinal);
+"""
+
+
+# ============================================================================
+# 2. SHARED CLASSIFICATION & INTROSPECTION HELPERS
+# ============================================================================
+
+DUNDER_CATEGORIES: dict[str, str] = {
+    "__new__": "lifecycle", "__init__": "lifecycle", "__del__": "lifecycle", "__post_init__": "lifecycle",
+    "__init_subclass__": "meta", "__class_getitem__": "meta", "__mro_entries__": "meta", "__prepare__": "meta",
+    "__repr__": "representation", "__str__": "representation", "__bytes__": "representation", "__format__": "representation",
+    "__lt__": "comparison", "__le__": "comparison", "__eq__": "comparison",
+    "__ne__": "comparison", "__gt__": "comparison", "__ge__": "comparison", "__hash__": "comparison", "__bool__": "comparison",
+    "__getattr__": "attribute_access", "__getattribute__": "attribute_access",
+    "__setattr__": "attribute_access", "__delattr__": "attribute_access", "__dir__": "attribute_access",
+    "__get__": "descriptor", "__set__": "descriptor", "__delete__": "descriptor", "__set_name__": "descriptor",
+    "__call__": "callable",
+    "__len__": "container", "__length_hint__": "container", "__getitem__": "container",
+    "__setitem__": "container", "__delitem__": "container", "__missing__": "container",
+    "__iter__": "container", "__reversed__": "container", "__contains__": "container",
+    "__enter__": "context_manager", "__exit__": "context_manager",
+    "__await__": "async", "__aiter__": "async", "__anext__": "async", "__aenter__": "async", "__aexit__": "async",
+    "__add__": "numeric", "__sub__": "numeric", "__mul__": "numeric", "__matmul__": "numeric",
+    "__truediv__": "numeric", "__floordiv__": "numeric", "__mod__": "numeric", "__divmod__": "numeric",
+    "__pow__": "numeric", "__lshift__": "numeric", "__rshift__": "numeric",
+    "__and__": "numeric", "__xor__": "numeric", "__or__": "numeric",
+    "__neg__": "numeric", "__pos__": "numeric", "__abs__": "numeric", "__invert__": "numeric",
+    "__int__": "numeric", "__float__": "numeric", "__complex__": "numeric", "__index__": "numeric",
+    "__round__": "numeric", "__trunc__": "numeric", "__floor__": "numeric", "__ceil__": "numeric",
+}
+
+
+def classify_identifier_visibility(name: str, dunder_all: set[str] | None = None) -> tuple[str, int]:
+    if name.startswith("__") and name.endswith("__") and len(name) > 4:
+        return ("system_dunder", 0)
+    if name.startswith("__") and not name.endswith("__"):
+        return ("private_mangled", 1)
+    if name.startswith("_"):
+        return ("hidden_internal", 1)
+    if dunder_all is not None and name in dunder_all:
+        return ("exported_all", 0)
+    return ("public_implicit", 0)
+
+
+def safe_repr(val: Any, max_len: int = 160) -> str | None:
+    try:
+        if isinstance(val, (int, float, bool, str, bytes, complex)) or val is None or val is Ellipsis or val is NotImplemented:
+            r = repr(val)
+            return r if len(r) <= max_len else r[: max_len - 3] + "..."
+        return f"<{type(val).__name__}>"
+    except Exception:
+        return "<unrepresentable>"
+
+
+def compute_file_sha256(path_str: str | None) -> str | None:
+    if not path_str:
+        return None
+    p = Path(path_str)
+    if not p.is_file():
+        return None
+    try:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def get_pure_builtins_without_site() -> set[str]:
+    try:
+        out = subprocess.check_output(
+            [sys.executable, "-S", "-c", "import builtins, json; print(json.dumps(list(builtins.__dict__.keys())))"],
+            text=True,
+            timeout=5,
+        )
+        return set(json.loads(out.strip()))
+    except Exception:
+        return set(builtins.__dict__.keys())
+
+
+def extract_callable_signature(obj: Any) -> tuple[str | None, str, str | None, list[dict[str, Any]]]:
+    params_list: list[dict[str, Any]] = []
+    try:
+        sig = inspect.signature(obj)
+        ret_expr = None
+        if sig.return_annotation is not inspect.Signature.empty:
+            ret_expr = (
+                sig.return_annotation
+                if isinstance(sig.return_annotation, str)
+                else getattr(sig.return_annotation, "__name__", str(sig.return_annotation))
+            )
+
+        for idx, (_, param) in enumerate(sig.parameters.items()):
+            kind_map = {
+                inspect.Parameter.POSITIONAL_ONLY: "positional_only",
+                inspect.Parameter.POSITIONAL_OR_KEYWORD: "positional_or_keyword",
+                inspect.Parameter.VAR_POSITIONAL: "var_positional",
+                inspect.Parameter.KEYWORD_ONLY: "keyword_only",
+                inspect.Parameter.VAR_KEYWORD: "var_keyword",
+            }
+            ann_str = None
+            if param.annotation is not inspect.Parameter.empty:
+                ann_str = (
+                    param.annotation
+                    if isinstance(param.annotation, str)
+                    else getattr(param.annotation, "__name__", str(param.annotation))
+                )
+            def_str = None
+            is_opt = 0
+            if param.default is not inspect.Parameter.empty:
+                def_str = safe_repr(param.default, 80)
+                is_opt = 1
+            elif param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                is_opt = 1
+
+            params_list.append({
+                "ordinal": idx,
+                "name": param.name,
+                "pass_kind": kind_map.get(param.kind, "positional_or_keyword"),
+                "type_expr": ann_str,
+                "type_source": "runtime_annotation" if ann_str is not None else None,
+                "default_expr": def_str,
+                "is_optional": is_opt,
+            })
+
+        source = "text_signature" if getattr(obj, "__text_signature__", None) else "inspect_signature"
+        return (str(sig), source, ret_expr, params_list)
+    except (ValueError, TypeError):
+        doc = getattr(obj, "__doc__", None)
+        if isinstance(doc, str) and doc.strip():
+            first_line = doc.strip().splitlines()[0].strip()
+            if "(" in first_line and ")" in first_line:
+                return (first_line, "docstring_first_line", None, [])
+        return (None, "unknown", None, [])
+
+
+def parse_ast_func_signature(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    skip_implicit_first_param: bool = False,
+) -> tuple[str, str | None, list[str], list[dict[str, Any]], dict[str, str]]:
+    """
+    Shared AST signature parser for both `.pyi` overlays and Stratum 3 `.py` files.
+    Returns (raw_signature, return_type_expr, type_params, params_list, param_type_map).
+    """
+    args = node.args
+    params: list[dict[str, Any]] = []
+    param_type_map: dict[str, str] = {}
+    ordinal = 0
+
+    pos_all = list(args.posonlyargs) + list(args.args)
+    num_pos_defaults = len(args.defaults)
+    default_start_idx = len(pos_all) - num_pos_defaults
+
+    for idx, arg in enumerate(pos_all):
+        ann_str = ast.unparse(arg.annotation) if arg.annotation else None
+        if ann_str:
+            param_type_map[arg.arg] = ann_str
+        if skip_implicit_first_param and idx == 0 and arg.arg in ("self", "cls"):
+            continue
+        pass_kind = "positional_only" if idx < len(args.posonlyargs) else "positional_or_keyword"
+        def_node = args.defaults[idx - default_start_idx] if idx >= default_start_idx else None
+        def_str = ast.unparse(def_node) if def_node is not None else None
+        params.append({
+            "ordinal": ordinal,
+            "name": arg.arg,
+            "pass_kind": pass_kind,
+            "type_expr": ann_str,
+            "default_expr": def_str,
+            "is_optional": 1 if def_node is not None else 0,
+        })
+        ordinal += 1
+
+    if args.vararg is not None:
+        ann_str = ast.unparse(args.vararg.annotation) if args.vararg.annotation else None
+        params.append({
+            "ordinal": ordinal,
+            "name": args.vararg.arg,
+            "pass_kind": "var_positional",
+            "type_expr": ann_str,
+            "default_expr": None,
+            "is_optional": 1,
+        })
+        ordinal += 1
+
+    for kw_arg, kw_def in zip(args.kwonlyargs, args.kw_defaults):
+        ann_str = ast.unparse(kw_arg.annotation) if kw_arg.annotation else None
+        if ann_str:
+            param_type_map[kw_arg.arg] = ann_str
+        def_str = ast.unparse(kw_def) if kw_def is not None else None
+        params.append({
+            "ordinal": ordinal,
+            "name": kw_arg.arg,
+            "pass_kind": "keyword_only",
+            "type_expr": ann_str,
+            "default_expr": def_str,
+            "is_optional": 1 if kw_def is not None else 0,
+        })
+        ordinal += 1
+
+    if args.kwarg is not None:
+        ann_str = ast.unparse(args.kwarg.annotation) if args.kwarg.annotation else None
+        params.append({
+            "ordinal": ordinal,
+            "name": args.kwarg.arg,
+            "pass_kind": "var_keyword",
+            "type_expr": ann_str,
+            "default_expr": None,
+            "is_optional": 1,
+        })
+        ordinal += 1
+
+    ret_str = ast.unparse(node.returns) if node.returns is not None else None
+    raw_sig = f"({ast.unparse(args)})" + (f" -> {ret_str}" if ret_str else "")
+    type_params = [ast.unparse(tp) for tp in getattr(node, "type_params", [])]
+    return (raw_sig, ret_str, type_params, params, param_type_map)
+
+
+# ============================================================================
+# 3. RUNTIME SPECTRUM HARVESTER (STRATA 0, 1, 2)
+# ============================================================================
+
+class PythonSpectrumCataloger:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.env_id: int = -1
+        self.pure_builtin_names: set[str] = get_pure_builtins_without_site()
+
+    def init_db(self, reset: bool = False) -> None:
+        if reset:
+            for tbl in (
+                "py_symbol_facets", "py_container_facets", "symbol_aliases",
+                "state_members", "parameters", "callable_overloads", "callables",
+                "symbols", "containers", "distributions", "environments",
+            ):
+                self.conn.execute(f"DROP TABLE IF EXISTS {tbl};")
+        self.conn.executescript(SCHEMA_SQL)
+        self.conn.commit()
+
+    def register_environment(self) -> int:
+        vi = sys.version_info
+        plat = f"{platform.system()}-{platform.machine()}"
+        cur = self.conn.execute(
+            """
+            INSERT INTO environments (
+                language, runtime_name, language_version,
+                version_major, version_minor, version_micro,
+                platform_triplet, sys_platform, executable_path
+            )
+            VALUES ('python', ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(language, runtime_name, language_version, platform_triplet, executable_path)
+            DO UPDATE SET captured_at = CURRENT_TIMESTAMP
+            RETURNING env_id
+            """,
+            (
+                platform.python_implementation(),
+                platform.python_version(),
+                vi.major,
+                vi.minor,
+                vi.micro,
+                plat,
+                sys.platform,
+                sys.executable,
+            ),
+        )
+        self.env_id = int(cur.fetchone()[0])
+        self.conn.commit()
+        return self.env_id
+
+    def register_distribution(self, stratum: int, dist_name: str, dist_version: str, summary: str | None = None) -> int:
+        cur = self.conn.execute(
+            """
+            INSERT INTO distributions (env_id, stratum, dist_name, dist_version, summary)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(env_id, stratum, dist_name, dist_version)
+            DO UPDATE SET summary = COALESCE(excluded.summary, distributions.summary)
+            RETURNING dist_id
+            """,
+            (self.env_id, stratum, dist_name, dist_version, summary),
+        )
+        return int(cur.fetchone()[0])
+
+    def register_container(
+        self,
+        *,
+        dist_id: int,
+        parent_id: int | None,
+        container_kind: str,
+        qualified_name: str,
+        short_name: str,
+        requires_import: int,
+        visibility: str,
+        is_hidden: int,
+        physical_path: str | None = None,
+        docstring: str | None = None,
+        module_origin_kind: str | None = None,
+        dunder_all: list[str] | None = None,
+        has_lazy_getattr: bool = False,
+        base_classes: list[str] | None = None,
+        mro_list: list[str] | None = None,
+        metaclass_name: str | None = None,
+        start_line: int | None = None,
+        start_col: int | None = None,
+        end_line: int | None = None,
+        end_col: int | None = None,
+    ) -> int:
+        sha = compute_file_sha256(physical_path)
+        cur = self.conn.execute(
+            """
+            INSERT INTO containers (
+                dist_id, parent_container_id, container_kind, qualified_name,
+                short_name, requires_import, visibility, is_hidden,
+                physical_path, sha256_hash, start_line, start_col, end_line, end_col, docstring
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(dist_id, qualified_name) DO UPDATE SET
+                physical_path = COALESCE(excluded.physical_path, containers.physical_path),
+                start_line = COALESCE(excluded.start_line, containers.start_line),
+                end_line = COALESCE(excluded.end_line, containers.end_line),
+                docstring = COALESCE(excluded.docstring, containers.docstring)
+            RETURNING container_id
+            """,
+            (
+                dist_id, parent_id, container_kind, qualified_name,
+                short_name, requires_import, visibility, is_hidden,
+                physical_path, sha, start_line, start_col, end_line, end_col, docstring,
+            ),
+        )
+        cid = int(cur.fetchone()[0])
+
+        self.conn.execute(
+            """
+            INSERT INTO py_container_facets (
+                container_id, module_origin_kind, has_dunder_all, dunder_all_json,
+                has_lazy_getattr, base_classes_json, mro_json, metaclass_name
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(container_id) DO UPDATE SET
+                module_origin_kind = COALESCE(excluded.module_origin_kind, py_container_facets.module_origin_kind)
+            """,
+            (
+                cid,
+                module_origin_kind,
+                1 if dunder_all is not None else 0,
+                json.dumps(dunder_all) if dunder_all is not None else None,
+                1 if has_lazy_getattr else 0,
+                json.dumps(base_classes) if base_classes is not None else None,
+                json.dumps(mro_list) if mro_list is not None else None,
+                metaclass_name,
+            ),
+        )
+        return cid
+
+    def harvest_stratum_0_ambient(self) -> None:
+        py_ver = platform.python_version()
+        dist_id = self.register_distribution(
+            stratum=0,
+            dist_name="<ambient>",
+            dist_version=py_ver,
+            summary="Unqualified Python ambient scope: keywords, builtins, site-builtins, and implicit module dunders.",
+        )
+
+        ambient_cid = self.register_container(
+            dist_id=dist_id,
+            parent_id=None,
+            container_kind="ambient_scope",
+            qualified_name="<ambient>",
+            short_name="<ambient>",
+            requires_import=0,
+            visibility="public",
+            is_hidden=0,
+            docstring="Symbols and syntax constructs available in Python without any import statement.",
+            module_origin_kind="ambient",
+        )
+
+        for kw in keyword.kwlist:
+            self._insert_keyword_symbol(ambient_cid, kw, is_soft=False)
+        for skw in getattr(keyword, "softkwlist", []):
+            self._insert_keyword_symbol(ambient_cid, skw, is_soft=True)
+
+        for d_name, d_type, d_doc in IMPLICIT_MODULE_DUNDERS:
+            cur = self.conn.execute(
+                """
+                INSERT INTO symbols (
+                    container_id, origin_container_id, name, qualified_name,
+                    symbol_kind, visibility, provenance, is_hidden, docstring
+                )
+                VALUES (?, ?, ?, ?, 'variable', 'system_dunder', 'implicit_dunder', 0, ?)
+                ON CONFLICT(container_id, name) DO NOTHING
+                RETURNING symbol_id
+                """,
+                (ambient_cid, ambient_cid, d_name, f"<ambient>.{d_name}", d_doc),
+            )
+            row = cur.fetchone()
+            if row:
+                sid = int(row[0])
+                self.conn.execute(
+                    """
+                    INSERT INTO state_members (
+                        symbol_id, declared_type_expr, runtime_type_name,
+                        is_constant, is_mutable, literal_value_repr, access_mode
+                    )
+                    VALUES (?, ?, ?, 0, 1, NULL, 'read_write')
+                    """,
+                    (sid, d_type, d_type),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO py_symbol_facets (symbol_id, py_runtime_type, is_c_implemented, dunder_category)
+                    VALUES (?, 'implicit_module_dunder', 1, 'meta')
+                    """,
+                    (sid,),
+                )
+
+        for name, obj in sorted(builtins.__dict__.items()):
+            provenance = "defined_here" if name in self.pure_builtin_names else "site_injected"
+            self._harvest_runtime_member(
+                dist_id=dist_id,
+                parent_cid=ambient_cid,
+                parent_qname="<ambient>",
+                module_name="builtins",
+                name=name,
+                obj=obj,
+                dunder_all=None,
+                requires_import=0,
+                override_provenance=provenance,
+            )
+
+        self.conn.commit()
+
+    def _insert_keyword_symbol(self, ambient_cid: int, kw: str, *, is_soft: bool) -> None:
+        kind = "soft_keyword" if is_soft else "keyword"
+        cur = self.conn.execute(
+            """
+            INSERT INTO symbols (
+                container_id, origin_container_id, name, qualified_name,
+                symbol_kind, visibility, provenance, is_hidden, docstring
+            )
+            VALUES (?, ?, ?, ?, ?, 'public_implicit', 'defined_here', 0, ?)
+            ON CONFLICT(container_id, name) DO NOTHING
+            RETURNING symbol_id
+            """,
+            (
+                ambient_cid,
+                ambient_cid,
+                kw,
+                f"<ambient>.{kw}",
+                kind,
+                f"Python {'soft ' if is_soft else ''}keyword `{kw}`.",
+            ),
+        )
+        row = cur.fetchone()
+        if row:
+            self.conn.execute(
+                """
+                INSERT INTO py_symbol_facets (symbol_id, py_runtime_type, is_c_implemented)
+                VALUES (?, ?, 1)
+                """,
+                (int(row[0]), kind),
+            )
+
+    def discover_stdlib_modules(self, include_submodules: bool = False) -> list[str]:
+        names: set[str] = set(sys.builtin_module_names)
+        if hasattr(sys, "stdlib_module_names"):
+            names.update(sys.stdlib_module_names)
+
+        for path_key in ("stdlib", "platstdlib"):
+            p_str = sysconfig.get_path(path_key)
+            if p_str and Path(p_str).is_dir():
+                for mod_info in pkgutil.iter_modules([p_str]):
+                    names.add(mod_info.name)
+
+        filtered = sorted(
+            n for n in names
+            if n not in SIDE_EFFECT_STDLIB_MODULES and not n.startswith("test.")
+        )
+
+        if not include_submodules:
+            return filtered
+
+        expanded: list[str] = []
+        for mod_name in filtered:
+            expanded.append(mod_name)
+            try:
+                spec = importlib.util.find_spec(mod_name)
+                if spec and spec.submodule_search_locations:
+                    for sub in pkgutil.walk_packages(spec.submodule_search_locations, prefix=f"{mod_name}."):
+                        if not any(part in SIDE_EFFECT_STDLIB_MODULES for part in sub.name.split(".")):
+                            expanded.append(sub.name)
+            except Exception:
+                continue
+        return sorted(set(expanded))
+
+    def harvest_stratum_1_stdlib(self, module_filter: set[str] | None = None, include_submodules: bool = False) -> None:
+        py_ver = platform.python_version()
+        dist_id = self.register_distribution(
+            stratum=1,
+            dist_name="python-stdlib",
+            dist_version=py_ver,
+            summary=f"Standard library and compiled-in modules shipped with {platform.python_implementation()} {py_ver}.",
+        )
+
+        candidates = self.discover_stdlib_modules(include_submodules=include_submodules)
+        if module_filter:
+            candidates = [
+                m for m in candidates
+                if m in module_filter or m.split(".")[0] in module_filter
+            ]
+
+        for mod_name in candidates:
+            self.harvest_module_by_name(dist_id=dist_id, mod_name=mod_name)
+        self.conn.commit()
+
+    def harvest_stratum_2_third_party(self, target_packages: set[str] | None = None) -> None:
+        pkg_to_dists = importlib.metadata.packages_distributions()
+        visited_dists: set[tuple[str, str]] = set()
+
+        for dist in importlib.metadata.distributions():
+            dist_name = dist.metadata["Name"] or "unknown"
+            dist_ver = dist.version or "0.0.0"
+            if (dist_name, dist_ver) in visited_dists:
+                continue
+            visited_dists.add((dist_name, dist_ver))
+
+            summary = dist.metadata.get("Summary")
+            dist_id = self.register_distribution(
+                stratum=2,
+                dist_name=dist_name,
+                dist_version=dist_ver,
+                summary=summary,
+            )
+
+            if target_packages is not None:
+                top_pkgs = [
+                    pkg for pkg, d_names in pkg_to_dists.items()
+                    if dist_name in d_names
+                ]
+                if dist_name not in target_packages and not any(p in target_packages for p in top_pkgs):
+                    continue
+                for pkg in sorted(set(top_pkgs)):
+                    if pkg in target_packages or dist_name in target_packages:
+                        self.harvest_module_by_name(dist_id=dist_id, mod_name=pkg)
+        self.conn.commit()
+
+    def _classify_module_origin(self, mod_name: str, mod: types.ModuleType) -> tuple[str, str | None]:
+        if mod_name in sys.builtin_module_names:
+            return ("builtin_c", None)
+        spec = getattr(mod, "__spec__", None)
+        origin = getattr(spec, "origin", None) if spec else getattr(mod, "__file__", None)
+        if origin == "frozen" or (spec and getattr(spec, "loader", None) and "Frozen" in type(spec.loader).__name__):
+            return ("frozen", None)
+        if origin == "built-in":
+            return ("builtin_c", None)
+        if spec and spec.submodule_search_locations and origin is None:
+            return ("namespace_pkg", None)
+        if isinstance(origin, str):
+            for ext in importlib.machinery.EXTENSION_SUFFIXES:
+                if origin.endswith(ext):
+                    return ("c_extension", origin)
+            return ("pure_python", origin)
+        return ("unknown", None)
+
+    def harvest_module_by_name(self, dist_id: int, mod_name: str) -> int | None:
+        if mod_name in SIDE_EFFECT_STDLIB_MODULES:
+            return None
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            return None
+
+        origin_kind, phys_path = self._classify_module_origin(mod_name, mod)
+        is_pkg = hasattr(mod, "__path__")
+        container_kind = "package" if is_pkg else "module"
+        short_name = mod_name.rsplit(".", 1)[-1]
+        vis, is_hid = classify_identifier_visibility(short_name)
+
+        raw_all = getattr(mod, "__all__", None)
+        dunder_all_list = [str(x) for x in raw_all] if isinstance(raw_all, (list, tuple, set, frozenset)) else None
+        dunder_all_set = set(dunder_all_list) if dunder_all_list is not None else None
+        has_lazy_getattr = "__getattr__" in mod.__dict__
+
+        parent_cid: int | None = None
+        if "." in mod_name:
+            parent_name = mod_name.rsplit(".", 1)[0]
+            row = self.conn.execute(
+                "SELECT container_id FROM containers WHERE dist_id = ? AND qualified_name = ? LIMIT 1",
+                (dist_id, parent_name),
+            ).fetchone()
+            if row:
+                parent_cid = int(row[0])
+
+        mod_cid = self.register_container(
+            dist_id=dist_id,
+            parent_id=parent_cid,
+            container_kind=container_kind,
+            qualified_name=mod_name,
+            short_name=short_name,
+            requires_import=1,
+            visibility=vis,
+            is_hidden=is_hid,
+            physical_path=phys_path,
+            docstring=inspect.getdoc(mod),
+            module_origin_kind=origin_kind,
+            dunder_all=dunder_all_list,
+            has_lazy_getattr=has_lazy_getattr,
+        )
+
+        mod_annotations = getattr(mod, "__annotations__", {}) or {}
+
+        for attr_name, obj in sorted(mod.__dict__.items()):
+            if attr_name in IMPLICIT_MODULE_DUNDERS or attr_name in ("__all__", "__path__"):
+                continue
+
+            if isinstance(obj, types.ModuleType):
+                target_mod_name = getattr(obj, "__name__", attr_name)
+                in_all = 1 if (dunder_all_set and attr_name in dunder_all_set) else 0
+                self.conn.execute(
+                    """
+                    INSERT INTO symbol_aliases (
+                        source_container_id, exposed_name, target_module_name,
+                        target_symbol_name, alias_kind, is_in_dunder_all
+                    )
+                    VALUES (?, ?, ?, '<module>', 'imported_module_ref', ?)
+                    ON CONFLICT(source_container_id, exposed_name) DO NOTHING
+                    """,
+                    (mod_cid, attr_name, target_mod_name, in_all),
+                )
+                continue
+
+            obj_mod = getattr(obj, "__module__", None)
+            if isinstance(obj_mod, str) and obj_mod != mod_name:
+                in_all = dunder_all_set is not None and attr_name in dunder_all_set
+                is_backing_c_mod = (
+                    obj_mod.startswith(f"_{mod_name.split('.')[0]}")
+                    or obj_mod.startswith(f"{mod_name}._")
+                    or (mod_name == "os" and obj_mod in ("posix", "nt", "genericpath", "posixpath", "ntpath"))
+                )
+                alias_kind = (
+                    "c_accelerator_reexport"
+                    if is_backing_c_mod
+                    else ("explicit_all_reexport" if in_all else "imported_symbol_ref")
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO symbol_aliases (
+                        source_container_id, exposed_name, target_module_name,
+                        target_symbol_name, alias_kind, is_in_dunder_all
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source_container_id, exposed_name) DO NOTHING
+                    """,
+                    (
+                        mod_cid,
+                        attr_name,
+                        obj_mod,
+                        getattr(obj, "__name__", attr_name),
+                        alias_kind,
+                        1 if in_all else 0,
+                    ),
+                )
+                if not in_all and not is_backing_c_mod:
+                    continue
+                provenance = "re_exported"
+            else:
+                provenance = "defined_here"
+
+            decl_ann = mod_annotations.get(attr_name)
+            decl_type_str = str(decl_ann) if decl_ann is not None else None
+
+            self._harvest_runtime_member(
+                dist_id=dist_id,
+                parent_cid=mod_cid,
+                parent_qname=mod_name,
+                module_name=mod_name,
+                name=attr_name,
+                obj=obj,
+                dunder_all=dunder_all_set,
+                requires_import=1,
+                override_provenance=provenance,
+                declared_type_expr=decl_type_str,
+            )
+
+        return mod_cid
+
+    def _harvest_runtime_member(
+        self,
+        *,
+        dist_id: int,
+        parent_cid: int,
+        parent_qname: str,
+        module_name: str,
+        name: str,
+        obj: Any,
+        dunder_all: set[str] | None,
+        requires_import: int,
+        override_provenance: str,
+        is_inside_class: bool = False,
+        declared_type_expr: str | None = None,
+    ) -> None:
+        vis, is_hid = classify_identifier_visibility(name, dunder_all)
+        qname = f"{parent_qname}.{name}"
+        py_type_name = type(obj).__name__
+        dunder_cat = DUNDER_CATEGORIES.get(name)
+
+        if inspect.isclass(obj):
+            is_exc = issubclass(obj, BaseException)
+            sym_kind = "exception" if is_exc else "class"
+            container_kind = "exception_class" if is_exc else "class"
+
+            bases = [f"{b.__module__}.{b.__qualname__}" for b in getattr(obj, "__bases__", ())]
+            mro = [f"{c.__module__}.{c.__qualname__}" for c in getattr(obj, "__mro__", ())]
+
+            cur = self.conn.execute(
+                """
+                INSERT INTO symbols (
+                    container_id, origin_container_id, name, qualified_name,
+                    symbol_kind, visibility, provenance, is_hidden, docstring
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(container_id, name) DO NOTHING
+                RETURNING symbol_id
+                """,
+                (parent_cid, parent_cid, name, qname, sym_kind, vis, override_provenance, is_hid, inspect.getdoc(obj)),
+            )
+            row = cur.fetchone()
+            if row:
+                sid = int(row[0])
+                self.conn.execute(
+                    """
+                    INSERT INTO py_symbol_facets (symbol_id, py_runtime_type, is_c_implemented, dunder_category)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (sid, py_type_name, 0 if hasattr(obj, "__dict__") and "__module__" in obj.__dict__ else 1, dunder_cat),
+                )
+                raw_sig, sig_src, ret_expr, params = extract_callable_signature(obj)
+                self._insert_callable_and_params(
+                    sid,
+                    is_async=0,
+                    is_generator=0,
+                    is_static=0,
+                    is_class_bound=1,
+                    return_type_expr=name,
+                    raw_signature=raw_sig,
+                    signature_source=sig_src,
+                    params=params,
+                )
+
+            if is_inside_class:
+                return
+
+            cls_cid = self.register_container(
+                dist_id=dist_id,
+                parent_id=parent_cid,
+                container_kind=container_kind,
+                qualified_name=qname,
+                short_name=name,
+                requires_import=requires_import,
+                visibility=vis,
+                is_hidden=is_hid,
+                docstring=inspect.getdoc(obj),
+                module_origin_kind="class_body",
+                base_classes=bases,
+                mro_list=mro,
+                metaclass_name=type(obj).__name__,
+            )
+
+            cls_annotations = getattr(obj, "__annotations__", {}) or {}
+            for m_name, m_obj in sorted(obj.__dict__.items()):
+                if m_name in ("__dict__", "__weakref__", "__doc__", "__module__"):
+                    continue
+                m_ann = cls_annotations.get(m_name)
+                self._harvest_runtime_member(
+                    dist_id=dist_id,
+                    parent_cid=cls_cid,
+                    parent_qname=qname,
+                    module_name=module_name,
+                    name=m_name,
+                    obj=m_obj,
+                    dunder_all=None,
+                    requires_import=requires_import,
+                    override_provenance="defined_here",
+                    is_inside_class=True,
+                    declared_type_expr=str(m_ann) if m_ann is not None else None,
+                )
+            return
+
+        if isinstance(obj, property) or py_type_name in ("getset_descriptor", "member_descriptor", "DynamicClassAttribute"):
+            acc_mode = "read_only"
+            if isinstance(obj, property) and obj.fset is not None:
+                acc_mode = "read_write_delete" if obj.fdel is not None else "read_write"
+            elif py_type_name in ("getset_descriptor", "member_descriptor"):
+                acc_mode = "read_write"
+
+            cur = self.conn.execute(
+                """
+                INSERT INTO symbols (
+                    container_id, origin_container_id, name, qualified_name,
+                    symbol_kind, visibility, provenance, is_hidden, docstring
+                )
+                VALUES (?, ?, ?, ?, 'property', ?, ?, ?, ?)
+                ON CONFLICT(container_id, name) DO NOTHING
+                RETURNING symbol_id
+                """,
+                (parent_cid, parent_cid, name, qname, vis, override_provenance, is_hid, inspect.getdoc(obj)),
+            )
+            row = cur.fetchone()
+            if row:
+                sid = int(row[0])
+                self.conn.execute(
+                    """
+                    INSERT INTO state_members (
+                        symbol_id, declared_type_expr, runtime_type_name,
+                        is_constant, is_mutable, literal_value_repr, access_mode
+                    )
+                    VALUES (?, ?, ?, 0, 1, NULL, ?)
+                    """,
+                    (sid, declared_type_expr, py_type_name, acc_mode),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO py_symbol_facets (symbol_id, py_runtime_type, descriptor_kind, is_c_implemented, dunder_category)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (sid, py_type_name, py_type_name, 0 if isinstance(obj, property) else 1, dunder_cat),
+                )
+            return
+
+        is_static = 0 if is_inside_class else 1
+        is_class_bound = 0
+        descriptor_kind: str | None = None
+        underlying_obj = obj
+        if isinstance(obj, staticmethod):
+            is_static = 1
+            descriptor_kind = "staticmethod"
+            underlying_obj = obj.__func__
+        elif isinstance(obj, classmethod):
+            is_static = 0
+            is_class_bound = 1
+            descriptor_kind = "classmethod"
+            underlying_obj = obj.__func__
+        elif py_type_name == "classmethod_descriptor":
+            is_class_bound = 1
+            descriptor_kind = "classmethod_descriptor"
+
+        if callable(underlying_obj) or py_type_name in (
+            "method_descriptor", "wrapper_descriptor", "builtin_function_or_method", "classmethod_descriptor"
+        ):
+            sym_kind = "constructor" if name in ("__init__", "__new__") else ("method" if is_inside_class else "function")
+            is_async = 1 if inspect.iscoroutinefunction(underlying_obj) or inspect.isasyncgenfunction(underlying_obj) else 0
+            is_gen = 1 if inspect.isgeneratorfunction(underlying_obj) or inspect.isasyncgenfunction(underlying_obj) else 0
+            code_obj = getattr(underlying_obj, "__code__", None)
+            co_flags = getattr(code_obj, "co_flags", None)
+            is_c_impl = 1 if code_obj is None else 0
+
+            cur = self.conn.execute(
+                """
+                INSERT INTO symbols (
+                    container_id, origin_container_id, name, qualified_name,
+                    symbol_kind, visibility, provenance, is_hidden, docstring
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(container_id, name) DO NOTHING
+                RETURNING symbol_id
+                """,
+                (parent_cid, parent_cid, name, qname, sym_kind, vis, override_provenance, is_hid, inspect.getdoc(underlying_obj)),
+            )
+            row = cur.fetchone()
+            if row:
+                sid = int(row[0])
+                raw_sig, sig_src, ret_expr, params = extract_callable_signature(underlying_obj)
+                self._insert_callable_and_params(
+                    sid,
+                    is_async=is_async,
+                    is_generator=is_gen,
+                    is_static=is_static,
+                    is_class_bound=is_class_bound,
+                    return_type_expr=ret_expr,
+                    raw_signature=raw_sig,
+                    signature_source=sig_src,
+                    params=params,
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO py_symbol_facets (
+                        symbol_id, py_runtime_type, descriptor_kind,
+                        is_c_implemented, co_flags, dunder_category
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (sid, py_type_name, descriptor_kind or py_type_name, is_c_impl, co_flags, dunder_cat),
+                )
+            return
+
+        is_const = 1 if (name.isupper() or name in ("True", "False", "None", "Ellipsis", "NotImplemented", "__debug__")) else 0
+        is_mut = 0 if isinstance(obj, (int, float, str, bytes, tuple, frozenset, bool)) or obj is None else 1
+        sym_kind = "constant" if is_const else "variable"
+
+        cur = self.conn.execute(
+            """
+            INSERT INTO symbols (
+                container_id, origin_container_id, name, qualified_name,
+                symbol_kind, visibility, provenance, is_hidden, docstring
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(container_id, name) DO NOTHING
+            RETURNING symbol_id
+            """,
+            (parent_cid, parent_cid, name, qname, sym_kind, vis, override_provenance, is_hid),
+        )
+        row = cur.fetchone()
+        if row:
+            sid = int(row[0])
+            self.conn.execute(
+                """
+                INSERT INTO state_members (
+                    symbol_id, declared_type_expr, runtime_type_name,
+                    is_constant, is_mutable, literal_value_repr, access_mode
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sid,
+                    declared_type_expr,
+                    py_type_name,
+                    is_const,
+                    is_mut,
+                    safe_repr(obj),
+                    "read_only" if is_const else "read_write",
+                ),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO py_symbol_facets (symbol_id, py_runtime_type, is_c_implemented, dunder_category)
+                VALUES (?, ?, 1, ?)
+                """,
+                (sid, py_type_name, dunder_cat),
+            )
+
+    def _insert_callable_and_params(
+        self,
+        symbol_id: int,
+        *,
+        is_async: int,
+        is_generator: int,
+        is_static: int,
+        is_class_bound: int,
+        return_type_expr: str | None,
+        raw_signature: str | None,
+        signature_source: str,
+        params: list[dict[str, Any]],
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO callables (
+                symbol_id, is_async, is_generator, is_static, is_class_bound,
+                return_type_expr, raw_signature, signature_source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol_id) DO NOTHING
+            """,
+            (symbol_id, is_async, is_generator, is_static, is_class_bound, return_type_expr, raw_signature, signature_source),
+        )
+        for p in params:
+            self.conn.execute(
+                """
+                INSERT INTO parameters (
+                    callable_symbol_id, overload_id, ordinal, name, pass_kind,
+                    type_expr, type_source, default_expr, is_optional
+                )
+                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    symbol_id,
+                    p["ordinal"],
+                    p["name"],
+                    p["pass_kind"],
+                    p["type_expr"],
+                    p.get("type_source"),
+                    p["default_expr"],
+                    p["is_optional"],
+                ),
+            )
+
+
+# ============================================================================
+# 4. PASS 4: STATIC .pyi (TYPESHED) AST OVERLAY ENGINE
+# ============================================================================
+
+class StaticPyiOverlayCataloger:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.py_version: tuple[int, int] = (sys.version_info.major, sys.version_info.minor)
+        self.sys_platform: str = sys.platform
+        self.enriched_callables: int = 0
+        self.inserted_overloads: int = 0
+        self.enriched_state_members: int = 0
+        self.stub_only_symbols: int = 0
+
+    @staticmethod
+    def auto_discover_typeshed_dirs() -> list[Path]:
+        found: list[Path] = []
+        for site_dir in sys.path:
+            if not site_dir:
+                continue
+            base = Path(site_dir)
+            for c in (
+                base / "mypy" / "typeshed" / "stdlib",
+                base / "typeshed_client" / "typeshed",
+                base / "pyright" / "dist" / "typeshed-fallback" / "stdlib",
+            ):
+                if c.is_dir() and (c / "builtins.pyi").is_file():
+                    found.append(c)
+        return found
+
+    def resolve_stub_file(self, typeshed_root: Path, mod_name: str) -> Path | None:
+        stdlib_dir = typeshed_root / "stdlib" if (typeshed_root / "stdlib").is_dir() else typeshed_root
+        parts = mod_name.split(".")
+        rel_file = stdlib_dir.joinpath(*parts).with_suffix(".pyi")
+        if rel_file.is_file():
+            return rel_file
+        rel_init = stdlib_dir.joinpath(*parts, "__init__.pyi")
+        if rel_init.is_file():
+            return rel_init
+        stubs_dir = typeshed_root / "stubs"
+        if stubs_dir.is_dir():
+            for pkg_dir in stubs_dir.iterdir():
+                cand_file = pkg_dir.joinpath(*parts).with_suffix(".pyi")
+                if cand_file.is_file():
+                    return cand_file
+                cand_init = pkg_dir.joinpath(*parts, "__init__.pyi")
+                if cand_init.is_file():
+                    return cand_init
+        return None
+
+    def overlay_from_directory(self, typeshed_root: Path, module_filter: set[str] | None = None) -> None:
+        rows = self.conn.execute(
+            """
+            SELECT container_id, qualified_name
+            FROM containers
+            WHERE container_kind IN ('ambient_scope', 'module', 'package')
+            """
+        ).fetchall()
+
+        for cid, qname in rows:
+            lookup_mod = "builtins" if qname == "<ambient>" else qname
+            if module_filter and lookup_mod != "builtins" and lookup_mod not in module_filter:
+                continue
+            stub_path = self.resolve_stub_file(typeshed_root, lookup_mod)
+            if stub_path is not None:
+                try:
+                    source = stub_path.read_text(encoding="utf-8")
+                    self.overlay_stub_source(
+                        container_id=int(cid),
+                        container_qname=qname,
+                        stub_source=source,
+                        stub_path_str=str(stub_path),
+                    )
+                except Exception:
+                    continue
+        self.conn.commit()
+
+    def overlay_embedded_demo_stubs(self) -> None:
+        for mod_key, stub_src in EMBEDDED_DEMO_STUBS.items():
+            qname = "<ambient>" if mod_key == "builtins" else mod_key
+            row = self.conn.execute(
+                "SELECT container_id FROM containers WHERE qualified_name = ? LIMIT 1",
+                (qname,),
+            ).fetchone()
+            if row:
+                self.overlay_stub_source(
+                    container_id=int(row[0]),
+                    container_qname=qname,
+                    stub_source=stub_src,
+                    stub_path_str=f"<embedded-typeshed:{mod_key}.pyi>",
+                )
+        self.conn.commit()
+
+    def overlay_stub_source(
+        self,
+        *,
+        container_id: int,
+        container_qname: str,
+        stub_source: str,
+        stub_path_str: str,
+    ) -> None:
+        tree = ast.parse(stub_source, filename=stub_path_str)
+        self.conn.execute(
+            "UPDATE containers SET stub_path = ? WHERE container_id = ?",
+            (stub_path_str, container_id),
+        )
+        active_stmts = self._flatten_active_statements(tree.body)
+        self._apply_statements_to_container(container_id, container_qname, active_stmts, is_class_scope=False)
+
+    def _flatten_active_statements(self, stmts: list[ast.stmt]) -> list[ast.stmt]:
+        out: list[ast.stmt] = []
+        for stmt in stmts:
+            if isinstance(stmt, ast.If):
+                branch_val = self._eval_static_guard(stmt.test)
+                if branch_val is True:
+                    out.extend(self._flatten_active_statements(stmt.body))
+                elif branch_val is False:
+                    out.extend(self._flatten_active_statements(stmt.orelse))
+                else:
+                    out.extend(self._flatten_active_statements(stmt.body))
+            else:
+                out.append(stmt)
+        return out
+
+    def _eval_static_guard(self, test: ast.expr) -> bool | None:
+        if isinstance(test, ast.BoolOp):
+            vals = [self._eval_static_guard(v) for v in test.values]
+            if isinstance(test.op, ast.And):
+                return False if any(v is False for v in vals) else (True if all(v is True for v in vals) else None)
+            if isinstance(test.op, ast.Or):
+                return True if any(v is True for v in vals) else (False if all(v is False for v in vals) else None)
+
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            inner = self._eval_static_guard(test.operand)
+            return (not inner) if inner is not None else None
+
+        if isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
+            left_s = ast.unparse(test.left).strip()
+            op = test.ops[0]
+            right_node = test.comparators[0]
+
+            if left_s in ("sys.version_info", "version_info") and isinstance(right_node, ast.Tuple):
+                try:
+                    ver_tuple = tuple(int(ast.literal_eval(elt)) for elt in right_node.elts[:2])
+                    lhs = self.py_version[: len(ver_tuple)]
+                    return self._apply_cmp(lhs, op, ver_tuple)
+                except Exception:
+                    return None
+
+            if left_s in ("sys.platform", "platform") and isinstance(right_node, ast.Constant) and isinstance(right_node.value, str):
+                return self._apply_cmp(self.sys_platform, op, right_node.value)
+
+        return None
+
+    @staticmethod
+    def _apply_cmp(lhs: Any, op: ast.cmpop, rhs: Any) -> bool | None:
+        if isinstance(op, ast.GtE):
+            return bool(lhs >= rhs)
+        if isinstance(op, ast.Gt):
+            return bool(lhs > rhs)
+        if isinstance(op, ast.LtE):
+            return bool(lhs <= rhs)
+        if isinstance(op, ast.Lt):
+            return bool(lhs < rhs)
+        if isinstance(op, ast.Eq):
+            return bool(lhs == rhs)
+        if isinstance(op, ast.NotEq):
+            return bool(lhs != rhs)
+        return None
+
+    def _apply_statements_to_container(
+        self,
+        container_id: int,
+        container_qname: str,
+        stmts: list[ast.stmt],
+        *,
+        is_class_scope: bool,
+    ) -> None:
+        func_groups: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_groups.setdefault(stmt.name, []).append(stmt)
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                self._overlay_ann_assign(container_id, container_qname, stmt, is_class_scope=is_class_scope)
+            elif isinstance(stmt, ast.ClassDef):
+                self._overlay_class_def(container_id, container_qname, stmt)
+
+        for func_name, defs in func_groups.items():
+            self._overlay_callable_group(container_id, container_qname, func_name, defs, is_class_scope=is_class_scope)
+
+    def _overlay_ann_assign(
+        self,
+        container_id: int,
+        container_qname: str,
+        stmt: ast.AnnAssign,
+        *,
+        is_class_scope: bool,
+    ) -> None:
+        assert isinstance(stmt.target, ast.Name)
+        var_name = stmt.target.id
+        type_str = ast.unparse(stmt.annotation)
+
+        row = self.conn.execute(
+            "SELECT symbol_id FROM symbols WHERE container_id = ? AND name = ? LIMIT 1",
+            (container_id, var_name),
+        ).fetchone()
+
+        if row:
+            sid = int(row[0])
+            self.conn.execute("UPDATE state_members SET declared_type_expr = ? WHERE symbol_id = ?", (type_str, sid))
+            self.conn.execute(
+                "UPDATE symbols SET provenance = 'pyi_enriched' WHERE symbol_id = ? AND provenance = 'defined_here'",
+                (sid,),
+            )
+            self.enriched_state_members += 1
+        else:
+            vis, is_hid = classify_identifier_visibility(var_name)
+            sym_kind = "property" if is_class_scope else ("constant" if var_name.isupper() else "variable")
+            qname = f"{container_qname}.{var_name}"
+            cur = self.conn.execute(
+                """
+                INSERT INTO symbols (
+                    container_id, origin_container_id, name, qualified_name,
+                    symbol_kind, visibility, provenance, is_hidden,
+                    start_line, start_col, end_line, end_col, docstring
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'pyi_stub_only', ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(container_id, name) DO NOTHING
+                RETURNING symbol_id
+                """,
+                (
+                    container_id, container_id, var_name, qname, sym_kind, vis, is_hid,
+                    stmt.lineno, stmt.col_offset, stmt.end_lineno, stmt.end_col_offset,
+                ),
+            )
+            res = cur.fetchone()
+            if res:
+                sid = int(res[0])
+                self.conn.execute(
+                    """
+                    INSERT INTO state_members (
+                        symbol_id, declared_type_expr, runtime_type_name,
+                        is_constant, is_mutable, literal_value_repr, access_mode
+                    )
+                    VALUES (?, ?, '<pyi_static>', ?, ?, NULL, 'read_write')
+                    """,
+                    (sid, type_str, 1 if var_name.isupper() else 0, 0 if var_name.isupper() else 1),
+                )
+                self.stub_only_symbols += 1
+
+    def _overlay_class_def(self, parent_cid: int, parent_qname: str, cls_node: ast.ClassDef) -> None:
+        cls_qname = f"{parent_qname}.{cls_node.name}"
+        row = self.conn.execute(
+            "SELECT container_id FROM containers WHERE qualified_name = ? LIMIT 1",
+            (cls_qname,),
+        ).fetchone()
+        if not row:
+            return
+        cls_cid = int(row[0])
+        active_body = self._flatten_active_statements(cls_node.body)
+        self._apply_statements_to_container(cls_cid, cls_qname, active_body, is_class_scope=True)
+
+    def _overlay_callable_group(
+        self,
+        container_id: int,
+        container_qname: str,
+        func_name: str,
+        defs: list[ast.FunctionDef | ast.AsyncFunctionDef],
+        *,
+        is_class_scope: bool,
+    ) -> None:
+        if len(defs) == 1 and self._has_decorator(defs[0], "property"):
+            ret_str = ast.unparse(defs[0].returns) if defs[0].returns else "Any"
+            row = self.conn.execute(
+                "SELECT symbol_id FROM symbols WHERE container_id = ? AND name = ? LIMIT 1",
+                (container_id, func_name),
+            ).fetchone()
+            if row:
+                self.conn.execute(
+                    "UPDATE state_members SET declared_type_expr = ? WHERE symbol_id = ?",
+                    (ret_str, int(row[0])),
+                )
+                self.enriched_state_members += 1
+            return
+
+        row = self.conn.execute(
+            "SELECT symbol_id FROM symbols WHERE container_id = ? AND name = ? LIMIT 1",
+            (container_id, func_name),
+        ).fetchone()
+
+        first_def = defs[0]
+        is_async = 1 if isinstance(first_def, ast.AsyncFunctionDef) else 0
+        is_static = 1 if (not is_class_scope or self._has_decorator(first_def, "staticmethod")) else 0
+        is_cls_bound = 1 if self._has_decorator(first_def, "classmethod") else 0
+
+        if row:
+            sid = int(row[0])
+            self.conn.execute(
+                "UPDATE symbols SET provenance = 'pyi_enriched' WHERE symbol_id = ? AND provenance = 'defined_here'",
+                (sid,),
+            )
+        else:
+            vis, is_hid = classify_identifier_visibility(func_name)
+            sym_kind = "constructor" if func_name in ("__init__", "__new__") else ("method" if is_class_scope else "function")
+            qname = f"{container_qname}.{func_name}"
+            cur = self.conn.execute(
+                """
+                INSERT INTO symbols (
+                    container_id, origin_container_id, name, qualified_name,
+                    symbol_kind, visibility, provenance, is_hidden,
+                    start_line, start_col, end_line, end_col, docstring
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'pyi_stub_only', ?, ?, ?, ?, ?, ?)
+                RETURNING symbol_id
+                """,
+                (
+                    container_id, container_id, func_name, qname, sym_kind, vis, is_hid,
+                    first_def.lineno, first_def.col_offset, first_def.end_lineno, first_def.end_col_offset,
+                    ast.get_docstring(first_def),
+                ),
+            )
+            sid = int(cur.fetchone()[0])
+            self.stub_only_symbols += 1
+
+        overload_defs = [d for d in defs if self._has_decorator(d, "overload")]
+        target_defs = overload_defs if len(overload_defs) > 0 else [defs[-1]]
+        is_overloaded = len(overload_defs) > 0
+
+        primary_sig, primary_ret, primary_tparams, primary_params, _ = parse_ast_func_signature(target_defs[0])
+        if is_overloaded:
+            unique_rets: list[str] = []
+            for d in overload_defs:
+                _, r_str, _, _, _ = parse_ast_func_signature(d)
+                if r_str and r_str not in unique_rets:
+                    unique_rets.append(r_str)
+            primary_ret = " | ".join(unique_rets) if unique_rets else primary_ret
+
+        sig_source = "pyi_overload_overlay" if is_overloaded else "pyi_stub_overlay"
+
+        self.conn.execute(
+            """
+            INSERT INTO callables (
+                symbol_id, is_async, is_generator, is_static, is_class_bound,
+                has_overloads, overload_count, type_params_json,
+                return_type_expr, raw_signature, signature_source
+            )
+            VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol_id) DO UPDATE SET
+                has_overloads = excluded.has_overloads,
+                overload_count = excluded.overload_count,
+                type_params_json = COALESCE(excluded.type_params_json, callables.type_params_json),
+                return_type_expr = COALESCE(excluded.return_type_expr, callables.return_type_expr),
+                raw_signature = excluded.raw_signature,
+                signature_source = excluded.signature_source
+            """,
+            (
+                sid,
+                is_async,
+                is_static,
+                is_cls_bound,
+                1 if is_overloaded else 0,
+                len(overload_defs),
+                json.dumps(primary_tparams) if primary_tparams else None,
+                primary_ret,
+                primary_sig,
+                sig_source,
+            ),
+        )
+
+        self.conn.execute("DELETE FROM parameters WHERE callable_symbol_id = ? AND overload_id IS NULL", (sid,))
+        for p in primary_params:
+            self.conn.execute(
+                """
+                INSERT INTO parameters (
+                    callable_symbol_id, overload_id, ordinal, name, pass_kind,
+                    type_expr, type_source, default_expr, is_optional
+                )
+                VALUES (?, NULL, ?, ?, ?, ?, 'pyi_stub', ?, ?)
+                """,
+                (sid, p["ordinal"], p["name"], p["pass_kind"], p["type_expr"], p["default_expr"], p["is_optional"]),
+            )
+
+        if is_overloaded:
+            self.conn.execute("DELETE FROM callable_overloads WHERE callable_symbol_id = ?", (sid,))
+            for ov_idx, ov_def in enumerate(overload_defs):
+                ov_sig, ov_ret, ov_tparams, ov_params, _ = parse_ast_func_signature(ov_def)
+                cur = self.conn.execute(
+                    """
+                    INSERT INTO callable_overloads (
+                        callable_symbol_id, overload_ordinal, type_params_json,
+                        return_type_expr, raw_signature
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    RETURNING overload_id
+                    """,
+                    (sid, ov_idx, json.dumps(ov_tparams) if ov_tparams else None, ov_ret, ov_sig),
+                )
+                ov_id = int(cur.fetchone()[0])
+                self.inserted_overloads += 1
+
+                for p in ov_params:
+                    self.conn.execute(
+                        """
+                        INSERT INTO parameters (
+                            callable_symbol_id, overload_id, ordinal, name, pass_kind,
+                            type_expr, type_source, default_expr, is_optional
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, 'pyi_stub', ?, ?)
+                        """,
+                        (sid, ov_id, p["ordinal"], p["name"], p["pass_kind"], p["type_expr"], p["default_expr"], p["is_optional"]),
+                    )
+
+        self.enriched_callables += 1
+
+    @staticmethod
+    def _has_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef, dec_name: str) -> bool:
+        for dec in node.decorator_list:
+            unparsed = ast.unparse(dec).strip()
+            if unparsed == dec_name or unparsed.endswith(f".{dec_name}"):
+                return True
+        return False
+
+
+# ============================================================================
+# 5. PASS 5 (STRATUM 3): LOCAL WORKSPACE / PROJECT PURE-AST HARVESTER
+# ============================================================================
+
+class WorkspaceAstCataloger:
+    """
+    Pure-AST harvester for Stratum 3 (Local Project / Workspace `.py` files).
+    Never imports or executes user code. Extracts:
+      - Packages (`__init__.py`), PEP 420 namespace packages, modules, and scripts
+      - Static `__all__` export lists
+      - Absolute and relative imports (`from ..pkg import sym`) into `symbol_aliases`
+      - Classes, base classes, metaclasses, class attributes, and `@property` descriptors
+      - Instance attributes (`self.x = ...` / `self.x: T = ...`) synthesized from `__init__`
+        with automatic parameter type propagation
+      - Functions, methods, `@overload` groups, static `is_generator` (`yield` / `yield from`),
+        and `is_async` flags
+      - Module globals, constants, `if TYPE_CHECKING:` blocks, `if __name__ == '__main__':` blocks,
+        and PEP 695 `type X = ...` aliases
+      - Exact 1-indexed line & 0-indexed column coordinates (`start_line`..`end_col`)
+    """
+
+    def __init__(self, cataloger: PythonSpectrumCataloger) -> None:
+        self.cataloger = cataloger
+        self.conn = cataloger.conn
+        self.files_scanned: int = 0
+        self.classes_found: int = 0
+        self.callables_found: int = 0
+        self.init_attrs_synthesized: int = 0
+        self.imports_recorded: int = 0
+
+    def harvest_workspace(
+        self,
+        workspace_root: Path,
+        *,
+        project_name: str | None = None,
+        project_version: str = "0.1.0-local",
+    ) -> int:
+        workspace_root = workspace_root.resolve()
+        dist_name = project_name or workspace_root.name
+        dist_id = self.cataloger.register_distribution(
+            stratum=3,
+            dist_name=dist_name,
+            dist_version=project_version,
+            summary=f"Local workspace Python source tree at {workspace_root}",
+        )
+
+        discovered = self._discover_workspace_py_files(workspace_root)
+        for mod_qname, is_pkg, is_script, py_path in discovered:
+            self._harvest_workspace_file(
+                dist_id=dist_id,
+                mod_qname=mod_qname,
+                is_pkg=is_pkg,
+                is_script=is_script,
+                py_path=py_path,
+            )
+
+        self.conn.commit()
+        return dist_id
+
+    def _discover_workspace_py_files(self, workspace_root: Path) -> list[tuple[str, bool, bool, Path]]:
+        """
+        Discovers all `.py` files under `workspace_root`, automatically handling `src/`
+        layouts and sorting parent packages before child submodules.
+        Returns list of (qualified_module_name, is_package, is_top_script, file_path).
+        """
+        src_Layout_dir = workspace_root / "src"
+        has_src_layout = src_Layout_dir.is_dir()
+
+        results: list[tuple[str, bool, bool, Path]] = []
+        for py_file in sorted(workspace_root.rglob("*.py")):
+            rel_parts = py_file.relative_to(workspace_root).parts
+            if any(part in WORKSPACE_IGNORED_DIRS or part.endswith(".egg-info") for part in rel_parts):
+                continue
+
+            # If inside `src/<pkg>/...`, compute dotted module path relative to `src/`
+            if has_src_layout and rel_parts[0] == "src" and len(rel_parts) > 1:
+                mod_parts = list(rel_parts[1:])
+            else:
+                mod_parts = list(rel_parts)
+
+            if mod_parts[-1] == "__init__.py":
+                pkg_parts = mod_parts[:-1]
+                if not pkg_parts:
+                    mod_qname = workspace_root.name
+                else:
+                    mod_qname = ".".join(pkg_parts)
+                results.append((mod_qname, True, False, py_file))
+            else:
+                stem = Path(mod_parts[-1]).stem
+                dotted_parts = [*mod_parts[:-1], stem]
+                mod_qname = ".".join(dotted_parts)
+                is_top_script = len(dotted_parts) == 1
+                results.append((mod_qname, False, is_top_script, py_file))
+
+        # Sort so shorter package names (`pkg`) are registered before submodules (`pkg.sub`)
+        results.sort(key=lambda item: (item[0].count("."), 0 if item[1] else 1, item[0]))
+        return results
+
+    def _harvest_workspace_file(
+        self,
+        *,
+        dist_id: int,
+        mod_qname: str,
+        is_pkg: bool,
+        is_script: bool,
+        py_path: Path,
+    ) -> None:
+        try:
+            source = py_path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_path))
+        except Exception:
+            return
+
+        self.files_scanned += 1
+        dunder_all_list = self._extract_static_dunder_all(tree.body)
+        dunder_all_set = set(dunder_all_list) if dunder_all_list is not None else None
+        has_lazy_getattr = any(
+            isinstance(s, ast.FunctionDef) and s.name == "__getattr__" for s in tree.body
+        )
+
+        parent_cid = self._ensure_parent_package_containers(dist_id, mod_qname)
+        short_name = mod_qname.rsplit(".", 1)[-1]
+        vis, is_hid = classify_identifier_visibility(short_name)
+
+        mod_cid = self.cataloger.register_container(
+            dist_id=dist_id,
+            parent_id=parent_cid,
+            container_kind="package" if is_pkg else "module",
+            qualified_name=mod_qname,
+            short_name=short_name,
+            requires_import=0 if is_script else 1,
+            visibility=vis,
+            is_hidden=is_hid,
+            physical_path=str(py_path),
+            docstring=ast.get_docstring(tree),
+            module_origin_kind="workspace_script" if is_script else "workspace_py",
+            dunder_all=dunder_all_list,
+            has_lazy_getattr=has_lazy_getattr,
+            start_line=1,
+            start_col=0,
+            end_line=len(source.splitlines()) or 1,
+            end_col=0,
+        )
+
+        # Current package parts used for resolving relative imports (`from . import x`, `from ..y import z`)
+        current_pkg_parts = mod_qname.split(".") if is_pkg else mod_qname.split(".")[:-1]
+
+        self._walk_container_statements(
+            dist_id=dist_id,
+            container_id=mod_cid,
+            container_qname=mod_qname,
+            current_pkg_parts=current_pkg_parts,
+            stmts=tree.body,
+            dunder_all=dunder_all_set,
+            is_class_scope=False,
+            provenance="ast_defined",
+        )
+
+    def _ensure_parent_package_containers(self, dist_id: int, mod_qname: str) -> int | None:
+        """Ensures intermediate parent packages (including PEP 420 namespace folders) exist in `containers`."""
+        if "." not in mod_qname:
+            return None
+        parts = mod_qname.split(".")[:-1]
+        parent_cid: int | None = None
+        for idx in range(1, len(parts) + 1):
+            prefix_qname = ".".join(parts[:idx])
+            row = self.conn.execute(
+                "SELECT container_id FROM containers WHERE dist_id = ? AND qualified_name = ? LIMIT 1",
+                (dist_id, prefix_qname),
+            ).fetchone()
+            if row:
+                parent_cid = int(row[0])
+            else:
+                short = parts[idx - 1]
+                vis, is_hid = classify_identifier_visibility(short)
+                parent_cid = self.cataloger.register_container(
+                    dist_id=dist_id,
+                    parent_id=parent_cid,
+                    container_kind="package",
+                    qualified_name=prefix_qname,
+                    short_name=short,
+                    requires_import=1,
+                    visibility=vis,
+                    is_hidden=is_hid,
+                    module_origin_kind="namespace_pkg",
+                )
+        return parent_cid
+
+    @staticmethod
+    def _extract_static_dunder_all(stmts: list[ast.stmt]) -> list[str] | None:
+        """Statically evaluates `__all__ = [...]` and `__all__ += [...]` string literals."""
+        exported: list[str] | None = None
+        for stmt in stmts:
+            val_node: ast.expr | None = None
+            if isinstance(stmt, ast.Assign):
+                if any(isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets):
+                    val_node = stmt.value
+                    if exported is None:
+                        exported = []
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == "__all__":
+                val_node = stmt.value
+                if exported is None:
+                    exported = []
+            elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == "__all__":
+                val_node = stmt.value
+                if exported is None:
+                    exported = []
+
+            if val_node is not None and isinstance(val_node, (ast.List, ast.Tuple, ast.Set)):
+                for elt in val_node.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        if exported is not None and elt.value not in exported:
+                            exported.append(elt.value)
+        return exported
+
+    def _walk_container_statements(
+        self,
+        *,
+        dist_id: int,
+        container_id: int,
+        container_qname: str,
+        current_pkg_parts: list[str],
+        stmts: list[ast.stmt],
+        dunder_all: set[str] | None,
+        is_class_scope: bool,
+        provenance: str,
+    ) -> None:
+        func_groups: dict[str, list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]]] = {}
+
+        for stmt in stmts:
+            # 1. Descend into conditional blocks (`if TYPE_CHECKING:`, `if __name__ == '__main__':`, `try/except`)
+            if isinstance(stmt, ast.If):
+                cond_str = ast.unparse(stmt.test).strip()
+                sub_prov = provenance
+                if "TYPE_CHECKING" in cond_str:
+                    sub_prov = "ast_type_checking_only"
+                elif "__name__" in cond_str and "__main__" in cond_str:
+                    sub_prov = "ast_main_guard"
+                self._walk_container_statements(
+                    dist_id=dist_id,
+                    container_id=container_id,
+                    container_qname=container_qname,
+                    current_pkg_parts=current_pkg_parts,
+                    stmts=stmt.body + stmt.orelse,
+                    dunder_all=dunder_all,
+                    is_class_scope=is_class_scope,
+                    provenance=sub_prov,
+                )
+                continue
+
+            if isinstance(stmt, ast.Try):
+                sub_stmts = list(stmt.body) + list(stmt.orelse) + list(stmt.finalbody)
+                for handler in stmt.handlers:
+                    sub_stmts.extend(handler.body)
+                self._walk_container_statements(
+                    dist_id=dist_id,
+                    container_id=container_id,
+                    container_qname=container_qname,
+                    current_pkg_parts=current_pkg_parts,
+                    stmts=sub_stmts,
+                    dunder_all=dunder_all,
+                    is_class_scope=is_class_scope,
+                    provenance=provenance,
+                )
+                continue
+
+            # 2. Imports (`import x` and `from ..pkg import y`)
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    exposed = alias.asname or alias.name.split(".")[0]
+                    in_all = 1 if (dunder_all and exposed in dunder_all) else 0
+                    self.conn.execute(
+                        """
+                        INSERT INTO symbol_aliases (
+                            source_container_id, exposed_name, target_module_name,
+                            target_symbol_name, alias_kind, is_in_dunder_all
+                        )
+                        VALUES (?, ?, ?, '<module>', 'workspace_import', ?)
+                        ON CONFLICT(source_container_id, exposed_name) DO NOTHING
+                        """,
+                        (container_id, exposed, alias.name, in_all),
+                    )
+                    self.imports_recorded += 1
+                continue
+
+            if isinstance(stmt, ast.ImportFrom):
+                resolved_mod = self._resolve_import_from_module(current_pkg_parts, stmt.module, stmt.level)
+                is_rel = stmt.level > 0
+                for alias in stmt.names:
+                    if alias.name == "*":
+                        self.conn.execute(
+                            """
+                            INSERT INTO symbol_aliases (
+                                source_container_id, exposed_name, target_module_name,
+                                target_symbol_name, alias_kind, is_in_dunder_all
+                            )
+                            VALUES (?, ?, ?, '*', 'wildcard_import', 0)
+                            ON CONFLICT(source_container_id, exposed_name) DO NOTHING
+                            """,
+                            (container_id, f"*:{resolved_mod}", resolved_mod),
+                        )
+                        self.imports_recorded += 1
+                        continue
+
+                    exposed = alias.asname or alias.name
+                    in_all = dunder_all is not None and exposed in dunder_all
+                    akind = (
+                        "explicit_all_reexport"
+                        if in_all
+                        else ("workspace_relative_import" if is_rel else "workspace_import")
+                    )
+                    self.conn.execute(
+                        """
+                        INSERT INTO symbol_aliases (
+                            source_container_id, exposed_name, target_module_name,
+                            target_symbol_name, alias_kind, is_in_dunder_all
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(source_container_id, exposed_name) DO NOTHING
+                        """,
+                        (container_id, exposed, resolved_mod, alias.name, akind, 1 if in_all else 0),
+                    )
+                    self.imports_recorded += 1
+                continue
+
+            # 3. PEP 695 `type Alias = ...` (Python 3.12+)
+            if hasattr(ast, "TypeAlias") and isinstance(stmt, ast.TypeAlias):
+                alias_name = stmt.name.id
+                val_expr = ast.unparse(stmt.value)
+                self._insert_ast_state_or_alias(
+                    container_id=container_id,
+                    container_qname=container_qname,
+                    name=alias_name,
+                    symbol_kind="type_alias",
+                    declared_type_expr=val_expr,
+                    runtime_type_name="TypeAliasType",
+                    literal_repr=val_expr,
+                    is_constant=1,
+                    is_mutable=0,
+                    dunder_all=dunder_all,
+                    provenance=provenance,
+                    node=stmt,
+                )
+                continue
+
+            # 4. Functions & Methods (grouped by name to merge `@overload` variants)
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_groups.setdefault(stmt.name, []).append((stmt, provenance))
+                continue
+
+            # 5. Classes & Exceptions
+            if isinstance(stmt, ast.ClassDef):
+                self._harvest_ast_class(
+                    dist_id=dist_id,
+                    parent_cid=container_id,
+                    parent_qname=container_qname,
+                    current_pkg_parts=current_pkg_parts,
+                    cls_node=stmt,
+                    dunder_all=dunder_all,
+                    provenance=provenance,
+                )
+                continue
+
+            # 6. Annotated Assignments (`x: int = 10`)
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                var_name = stmt.target.id
+                if var_name == "__all__":
+                    continue
+                decl_t = ast.unparse(stmt.annotation)
+                val_repr = ast.unparse(stmt.value) if stmt.value is not None else None
+                inferred_rt = self._infer_ast_expr_type(stmt.value) or decl_t
+                is_const = 1 if (var_name.isupper() or "Final" in decl_t) else 0
+                sym_kind = "type_alias" if decl_t in ("TypeAlias", "typing.TypeAlias") else (
+                    "property" if is_class_scope else ("constant" if is_const else "variable")
+                )
+                self._insert_ast_state_or_alias(
+                    container_id=container_id,
+                    container_qname=container_qname,
+                    name=var_name,
+                    symbol_kind=sym_kind,
+                    declared_type_expr=decl_t,
+                    runtime_type_name=inferred_rt,
+                    literal_repr=val_repr,
+                    is_constant=is_const,
+                    is_mutable=0 if is_const else 1,
+                    dunder_all=dunder_all,
+                    provenance=provenance,
+                    node=stmt,
+                )
+                continue
+
+            # 7. Standard Assignments (`X = 42`)
+            if isinstance(stmt, ast.Assign):
+                val_repr = ast.unparse(stmt.value)
+                inferred_rt = self._infer_ast_expr_type(stmt.value) or "Any"
+                for tgt in stmt.targets:
+                    if isinstance(tgt, ast.Name) and tgt.id != "__all__":
+                        var_name = tgt.id
+                        is_const = 1 if var_name.isupper() else 0
+                        sym_kind = "property" if is_class_scope else ("constant" if is_const else "variable")
+                        self._insert_ast_state_or_alias(
+                            container_id=container_id,
+                            container_qname=container_qname,
+                            name=var_name,
+                            symbol_kind=sym_kind,
+                            declared_type_expr=inferred_rt if inferred_rt != "Any" else None,
+                            runtime_type_name=inferred_rt,
+                            literal_repr=val_repr[:160],
+                            is_constant=is_const,
+                            is_mutable=0 if is_const else 1,
+                            dunder_all=dunder_all,
+                            provenance=provenance,
+                            node=stmt,
+                        )
+
+        # Process grouped callables & properties
+        for func_name, def_tuples in func_groups.items():
+            self._harvest_ast_callable_group(
+                container_id=container_id,
+                container_qname=container_qname,
+                func_name=func_name,
+                def_tuples=def_tuples,
+                dunder_all=dunder_all,
+                is_class_scope=is_class_scope,
+            )
+
+    @staticmethod
+    def _resolve_import_from_module(current_pkg_parts: list[str], module: str | None, level: int) -> str:
+        if level == 0:
+            return module or ""
+        up_count = max(0, level - 1)
+        anchor = current_pkg_parts[: max(0, len(current_pkg_parts) - up_count)]
+        if module:
+            anchor.extend(module.split("."))
+        return ".".join(anchor) if anchor else (module or ".")
+
+    def _harvest_ast_class(
+        self,
+        *,
+        dist_id: int,
+        parent_cid: int,
+        parent_qname: str,
+        current_pkg_parts: list[str],
+        cls_node: ast.ClassDef,
+        dunder_all: set[str] | None,
+        provenance: str,
+    ) -> None:
+        self.classes_found += 1
+        cls_name = cls_node.name
+        cls_qname = f"{parent_qname}.{cls_name}"
+        vis, is_hid = classify_identifier_visibility(cls_name, dunder_all)
+
+        bases = [ast.unparse(b) for b in cls_node.bases]
+        is_exc = any(
+            b.endswith("Error") or b.endswith("Exception") or b in ("Exception", "BaseException", "RuntimeError", "ValueError")
+            for b in bases
+        )
+        sym_kind = "exception" if is_exc else "class"
+        container_kind = "exception_class" if is_exc else "class"
+
+        metaclass_name: str | None = None
+        for kw in cls_node.keywords:
+            if kw.arg == "metaclass":
+                metaclass_name = ast.unparse(kw.value)
+
+        # Register class symbol in parent container
+        cur = self.conn.execute(
+            """
+            INSERT INTO symbols (
+                container_id, origin_container_id, name, qualified_name,
+                symbol_kind, visibility, provenance, is_hidden,
+                start_line, start_col, end_line, end_col, docstring
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(container_id, name) DO NOTHING
+            RETURNING symbol_id
+            """,
+            (
+                parent_cid, parent_cid, cls_name, cls_qname, sym_kind, vis, provenance, is_hid,
+                cls_node.lineno, cls_node.col_offset, cls_node.end_lineno, cls_node.end_col_offset,
+                ast.get_docstring(cls_node),
+            ),
+        )
+        row = cur.fetchone()
+        cls_symbol_id = int(row[0]) if row else None
+        if cls_symbol_id is not None:
+            self.conn.execute(
+                """
+                INSERT INTO py_symbol_facets (symbol_id, py_runtime_type, is_c_implemented)
+                VALUES (?, 'type', 0)
+                """,
+                (cls_symbol_id,),
+            )
+
+        # Register class as a Container for its methods, class attributes, and `self.<attr>` instance attributes
+        cls_cid = self.cataloger.register_container(
+            dist_id=dist_id,
+            parent_id=parent_cid,
+            container_kind=container_kind,
+            qualified_name=cls_qname,
+            short_name=cls_name,
+            requires_import=1,
+            visibility=vis,
+            is_hidden=is_hid,
+            docstring=ast.get_docstring(cls_node),
+            module_origin_kind="class_body",
+            base_classes=bases,
+            metaclass_name=metaclass_name,
+            start_line=cls_node.lineno,
+            start_col=cls_node.col_offset,
+            end_line=cls_node.end_lineno,
+            end_col=cls_node.end_col_offset,
+        )
+
+        # Walk class body for methods, nested classes, and class-level attributes
+        self._walk_container_statements(
+            dist_id=dist_id,
+            container_id=cls_cid,
+            container_qname=cls_qname,
+            current_pkg_parts=current_pkg_parts,
+            stmts=cls_node.body,
+            dunder_all=None,
+            is_class_scope=True,
+            provenance="ast_defined",
+        )
+
+        # Synthesize instance attributes (`self.x = ...` / `self.x: T = ...`) from `__init__` / `__new__` / `__post_init__`
+        for item in cls_node.body:
+            if isinstance(item, ast.FunctionDef) and item.name in ("__init__", "__new__", "__post_init__"):
+                self._harvest_init_instance_attributes(cls_cid, cls_qname, cls_name, item)
+
+                # Also mirror `__init__` signature onto the class symbol itself so `Order(...)` is callable
+                if item.name == "__init__" and cls_symbol_id is not None:
+                    raw_sig, _, tparams, params, _ = parse_ast_func_signature(
+                        item, skip_implicit_first_param=True
+                    )
+                    self.conn.execute(
+                        """
+                        INSERT INTO callables (
+                            symbol_id, is_async, is_generator, is_static, is_class_bound,
+                            has_overloads, overload_count, type_params_json,
+                            return_type_expr, raw_signature, signature_source
+                        )
+                        VALUES (?, 0, 0, 0, 1, 0, 0, ?, ?, ?, 'ast_source')
+                        ON CONFLICT(symbol_id) DO NOTHING
+                        """,
+                        (
+                            cls_symbol_id,
+                            json.dumps(tparams) if tparams else None,
+                            cls_name,
+                            raw_sig,
+                        ),
+                    )
+                    for p in params:
+                        self.conn.execute(
+                            """
+                            INSERT INTO parameters (
+                                callable_symbol_id, overload_id, ordinal, name, pass_kind,
+                                type_expr, type_source, default_expr, is_optional
+                            )
+                            VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                cls_symbol_id,
+                                p["ordinal"],
+                                p["name"],
+                                p["pass_kind"],
+                                p["type_expr"],
+                                "ast_annotation" if p["type_expr"] else None,
+                                p["default_expr"],
+                                p["is_optional"],
+                            ),
+                        )
+
+    def _harvest_init_instance_attributes(
+        self,
+        cls_cid: int,
+        cls_qname: str,
+        cls_name: str,
+        init_node: ast.FunctionDef,
+    ) -> None:
+        """
+        Walks `__init__` (or `__new__` / `__post_init__`) to extract `self.<attr>` assignments
+        and propagates parameter types when `self.x = x` matches a typed parameter `x: T`.
+        """
+        all_pos = list(init_node.args.posonlyargs) + list(init_node.args.args)
+        if not all_pos:
+            return
+        self_name = all_pos[0].arg
+        _, _, _, _, param_type_map = parse_ast_func_signature(init_node)
+
+        for subnode in ast.walk(init_node):
+            # Case A: `self.x: SomeType = val`
+            if isinstance(subnode, ast.AnnAssign) and isinstance(subnode.target, ast.Attribute):
+                if isinstance(subnode.target.value, ast.Name) and subnode.target.value.id == self_name:
+                    attr_name = subnode.target.attr
+                    decl_t = ast.unparse(subnode.annotation)
+                    val_repr = ast.unparse(subnode.value) if subnode.value is not None else None
+                    inferred_rt = self._infer_ast_expr_type(subnode.value, param_type_map) or decl_t
+                    self._insert_instance_attr(
+                        cls_cid=cls_cid,
+                        cls_qname=cls_qname,
+                        cls_name=cls_name,
+                        attr_name=attr_name,
+                        declared_type_expr=decl_t,
+                        runtime_type_name=inferred_rt,
+                        literal_repr=val_repr,
+                        node=subnode,
+                    )
+
+            # Case B: `self.x = val`
+            elif isinstance(subnode, ast.Assign):
+                for tgt in subnode.targets:
+                    if isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name) and tgt.value.id == self_name:
+                        attr_name = tgt.attr
+                        inferred_t = self._infer_ast_expr_type(subnode.value, param_type_map)
+                        val_repr = ast.unparse(subnode.value)
+                        self._insert_instance_attr(
+                            cls_cid=cls_cid,
+                            cls_qname=cls_qname,
+                            cls_name=cls_name,
+                            attr_name=attr_name,
+                            declared_type_expr=inferred_t,
+                            runtime_type_name=inferred_t or "Any",
+                            literal_repr=val_repr[:160],
+                            node=subnode,
+                        )
+
+    def _insert_instance_attr(
+        self,
+        *,
+        cls_cid: int,
+        cls_qname: str,
+        cls_name: str,
+        attr_name: str,
+        declared_type_expr: str | None,
+        runtime_type_name: str,
+        literal_repr: str | None,
+        node: ast.AST,
+    ) -> None:
+        vis, is_hid = classify_identifier_visibility(attr_name)
+        qname = f"{cls_qname}.{attr_name}"
+        cur = self.conn.execute(
+            """
+            INSERT INTO symbols (
+                container_id, origin_container_id, name, qualified_name,
+                symbol_kind, visibility, provenance, is_hidden,
+                start_line, start_col, end_line, end_col, docstring
+            )
+            VALUES (?, ?, ?, ?, 'property', ?, 'ast_init_attribute', ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(container_id, name) DO NOTHING
+            RETURNING symbol_id
+            """,
+            (
+                cls_cid, cls_cid, attr_name, qname, vis, is_hid,
+                getattr(node, "lineno", None),
+                getattr(node, "col_offset", None),
+                getattr(node, "end_lineno", None),
+                getattr(node, "end_col_offset", None),
+            ),
+        )
+        row = cur.fetchone()
+        if row:
+            sid = int(row[0])
+            self.init_attrs_synthesized += 1
+            self.conn.execute(
+                """
+                INSERT INTO state_members (
+                    symbol_id, declared_type_expr, runtime_type_name,
+                    is_constant, is_mutable, literal_value_repr, access_mode
+                )
+                VALUES (?, ?, ?, 0, 1, ?, 'read_write')
+                """,
+                (sid, declared_type_expr, runtime_type_name, literal_repr),
+            )
+            mangled_note = f"mangled:_{cls_name}{attr_name}" if vis == "private_mangled" else "instance_attribute"
+            self.conn.execute(
+                """
+                INSERT INTO py_symbol_facets (symbol_id, py_runtime_type, descriptor_kind, is_c_implemented)
+                VALUES (?, ?, 'instance_attribute', 0)
+                """,
+                (sid, mangled_note),
+            )
+
+    def _harvest_ast_callable_group(
+        self,
+        *,
+        container_id: int,
+        container_qname: str,
+        func_name: str,
+        def_tuples: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]],
+        dunder_all: set[str] | None,
+        is_class_scope: bool,
+    ) -> None:
+        defs = [d for d, _ in def_tuples]
+        provenance = def_tuples[-1][1]
+
+        # Handle `@property` getter / setter / deleter inside classes
+        if is_class_scope and any(self._has_decorator(d, "property") for d in defs):
+            prop_def = next(d for d in defs if self._has_decorator(d, "property"))
+            ret_t = ast.unparse(prop_def.returns) if prop_def.returns else "Any"
+            has_setter = any(self._has_decorator(d, f"{func_name}.setter") for d in defs)
+            has_deleter = any(self._has_decorator(d, f"{func_name}.deleter") for d in defs)
+            acc_mode = "read_write_delete" if has_deleter else ("read_write" if has_setter else "read_only")
+            vis, is_hid = classify_identifier_visibility(func_name)
+            qname = f"{container_qname}.{func_name}"
+            cur = self.conn.execute(
+                """
+                INSERT INTO symbols (
+                    container_id, origin_container_id, name, qualified_name,
+                    symbol_kind, visibility, provenance, is_hidden,
+                    start_line, start_col, end_line, end_col, docstring
+                )
+                VALUES (?, ?, ?, ?, 'property', ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(container_id, name) DO NOTHING
+                RETURNING symbol_id
+                """,
+                (
+                    container_id, container_id, func_name, qname, vis, provenance, is_hid,
+                    prop_def.lineno, prop_def.col_offset, prop_def.end_lineno, prop_def.end_col_offset,
+                    ast.get_docstring(prop_def),
+                ),
+            )
+            row = cur.fetchone()
+            if row:
+                sid = int(row[0])
+                self.conn.execute(
+                    """
+                    INSERT INTO state_members (
+                        symbol_id, declared_type_expr, runtime_type_name,
+                        is_constant, is_mutable, literal_value_repr, access_mode
+                    )
+                    VALUES (?, ?, 'property', 0, ?, NULL, ?)
+                    """,
+                    (sid, ret_t, 1 if has_setter else 0, acc_mode),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO py_symbol_facets (symbol_id, py_runtime_type, descriptor_kind, is_c_implemented)
+                    VALUES (?, 'property', 'property', 0)
+                    """,
+                    (sid,),
+                )
+            return
+
+        impl_def = defs[-1]
+        overload_defs = [d for d in defs if self._has_decorator(d, "overload")]
+        is_overloaded = len(overload_defs) > 0
+
+        vis, is_hid = classify_identifier_visibility(func_name, dunder_all)
+        sym_kind = "constructor" if func_name in ("__init__", "__new__") else ("method" if is_class_scope else "function")
+        qname = f"{container_qname}.{func_name}"
+
+        is_async = 1 if isinstance(impl_def, ast.AsyncFunctionDef) else 0
+        is_gen = 1 if self._is_ast_generator_function(impl_def) else 0
+        is_static = 1 if (not is_class_scope or self._has_decorator(impl_def, "staticmethod")) else 0
+        is_cls_bound = 1 if self._has_decorator(impl_def, "classmethod") else 0
+        dunder_cat = DUNDER_CATEGORIES.get(func_name)
+
+        cur = self.conn.execute(
+            """
+            INSERT INTO symbols (
+                container_id, origin_container_id, name, qualified_name,
+                symbol_kind, visibility, provenance, is_hidden,
+                start_line, start_col, end_line, end_col, docstring
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(container_id, name) DO NOTHING
+            RETURNING symbol_id
+            """,
+            (
+                container_id, container_id, func_name, qname, sym_kind, vis, provenance, is_hid,
+                impl_def.lineno, impl_def.col_offset, impl_def.end_lineno, impl_def.end_col_offset,
+                ast.get_docstring(impl_def),
+            ),
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        sid = int(row[0])
+        self.callables_found += 1
+
+        primary_sig, primary_ret, primary_tparams, primary_params, _ = parse_ast_func_signature(impl_def)
+        sig_source = "ast_overload_source" if is_overloaded else "ast_source"
+
+        self.conn.execute(
+            """
+            INSERT INTO callables (
+                symbol_id, is_async, is_generator, is_static, is_class_bound,
+                has_overloads, overload_count, type_params_json,
+                return_type_expr, raw_signature, signature_source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sid,
+                is_async,
+                is_gen,
+                is_static,
+                is_cls_bound,
+                1 if is_overloaded else 0,
+                len(overload_defs),
+                json.dumps(primary_tparams) if primary_tparams else None,
+                primary_ret,
+                primary_sig,
+                sig_source,
+            ),
+        )
+
+        for p in primary_params:
+            self.conn.execute(
+                """
+                INSERT INTO parameters (
+                    callable_symbol_id, overload_id, ordinal, name, pass_kind,
+                    type_expr, type_source, default_expr, is_optional
+                )
+                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sid,
+                    p["ordinal"],
+                    p["name"],
+                    p["pass_kind"],
+                    p["type_expr"],
+                    "ast_annotation" if p["type_expr"] else None,
+                    p["default_expr"],
+                    p["is_optional"],
+                ),
+            )
+
+        if is_overloaded:
+            for ov_idx, ov_def in enumerate(overload_defs):
+                ov_sig, ov_ret, ov_tparams, ov_params, _ = parse_ast_func_signature(ov_def)
+                cur_ov = self.conn.execute(
+                    """
+                    INSERT INTO callable_overloads (
+                        callable_symbol_id, overload_ordinal, type_params_json,
+                        return_type_expr, raw_signature
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    RETURNING overload_id
+                    """,
+                    (sid, ov_idx, json.dumps(ov_tparams) if ov_tparams else None, ov_ret, ov_sig),
+                )
+                ov_id = int(cur_ov.fetchone()[0])
+                for p in ov_params:
+                    self.conn.execute(
+                        """
+                        INSERT INTO parameters (
+                            callable_symbol_id, overload_id, ordinal, name, pass_kind,
+                            type_expr, type_source, default_expr, is_optional
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, 'ast_annotation', ?, ?)
+                        """,
+                        (sid, ov_id, p["ordinal"], p["name"], p["pass_kind"], p["type_expr"], p["default_expr"], p["is_optional"]),
+                    )
+
+        desc_kind = "staticmethod" if is_static and is_class_scope else ("classmethod" if is_cls_bound else "function")
+        self.conn.execute(
+            """
+            INSERT INTO py_symbol_facets (
+                symbol_id, py_runtime_type, descriptor_kind, is_c_implemented, dunder_category
+            )
+            VALUES (?, 'function', ?, 0, ?)
+            """,
+            (sid, desc_kind, dunder_cat),
+        )
+
+    def _insert_ast_state_or_alias(
+        self,
+        *,
+        container_id: int,
+        container_qname: str,
+        name: str,
+        symbol_kind: str,
+        declared_type_expr: str | None,
+        runtime_type_name: str,
+        literal_repr: str | None,
+        is_constant: int,
+        is_mutable: int,
+        dunder_all: set[str] | None,
+        provenance: str,
+        node: ast.AST,
+    ) -> None:
+        vis, is_hid = classify_identifier_visibility(name, dunder_all)
+        qname = f"{container_qname}.{name}"
+        cur = self.conn.execute(
+            """
+            INSERT INTO symbols (
+                container_id, origin_container_id, name, qualified_name,
+                symbol_kind, visibility, provenance, is_hidden,
+                start_line, start_col, end_line, end_col, docstring
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(container_id, name) DO NOTHING
+            RETURNING symbol_id
+            """,
+            (
+                container_id, container_id, name, qname, symbol_kind, vis, provenance, is_hid,
+                getattr(node, "lineno", None),
+                getattr(node, "col_offset", None),
+                getattr(node, "end_lineno", None),
+                getattr(node, "end_col_offset", None),
+            ),
+        )
+        row = cur.fetchone()
+        if row:
+            sid = int(row[0])
+            self.conn.execute(
+                """
+                INSERT INTO state_members (
+                    symbol_id, declared_type_expr, runtime_type_name,
+                    is_constant, is_mutable, literal_value_repr, access_mode
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sid,
+                    declared_type_expr,
+                    runtime_type_name,
+                    is_constant,
+                    is_mutable,
+                    literal_repr,
+                    "read_only" if is_constant else "read_write",
+                ),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO py_symbol_facets (symbol_id, py_runtime_type, is_c_implemented)
+                VALUES (?, ?, 0)
+                """,
+                (sid, runtime_type_name),
+            )
+
+    @staticmethod
+    def _has_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef, dec_name: str) -> bool:
+        for dec in node.decorator_list:
+            unparsed = ast.unparse(dec).strip()
+            if unparsed == dec_name or unparsed.endswith(f".{dec_name}"):
+                return True
+        return False
+
+    @classmethod
+    def _is_ast_generator_function(cls, func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        """Checks if a function body contains `yield` or `yield from` at its own lexical scope."""
+        stack: list[ast.AST] = list(func_node.body)
+        while stack:
+            curr = stack.pop()
+            if isinstance(curr, (ast.Yield, ast.YieldFrom)):
+                return True
+            # Do not descend into nested functions, classes, or lambdas
+            if isinstance(curr, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            stack.extend(ast.iter_child_nodes(curr))
+        return False
+
+    @staticmethod
+    def _infer_ast_expr_type(
+        expr: ast.expr | None,
+        param_type_map: dict[str, str] | None = None,
+    ) -> str | None:
+        if expr is None:
+            return None
+        if isinstance(expr, ast.Name) and param_type_map and expr.id in param_type_map:
+            return param_type_map[expr.id]
+        if isinstance(expr, ast.Constant):
+            if expr.value is None:
+                return "None"
+            return type(expr.value).__name__
+        if isinstance(expr, ast.List) or isinstance(expr, ast.ListComp):
+            return "list"
+        if isinstance(expr, ast.Dict) or isinstance(expr, ast.DictComp):
+            return "dict"
+        if isinstance(expr, ast.Set) or isinstance(expr, ast.SetComp):
+            return "set"
+        if isinstance(expr, ast.Tuple):
+            return "tuple"
+        if isinstance(expr, ast.Call):
+            if isinstance(expr.func, ast.Name):
+                return expr.func.id
+            if isinstance(expr.func, ast.Attribute):
+                return ast.unparse(expr.func)
+        return None
+
+
+# ============================================================================
+# 6. DIAGNOSTIC REPORT & CLI ENTRYPOINT
+# ============================================================================
+
+def print_spectrum_report(conn: sqlite3.Connection, db_path: Path) -> None:
+    print(f"\n======================================================================")
+    print(f" PYTHON SPECTRUM CATALOG SUMMARY (STRATA 0–3 + .pyi OVERLAY)")
+    print(f" Database: {db_path}")
+    print(f"======================================================================")
+
+    env = conn.execute("SELECT * FROM environments LIMIT 1").fetchone()
+    if env:
+        print(f" Runtime   : {env[2]} {env[3]} on {env[7]} (sys.platform={env[8]!r})")
+
+    print("\n--- 1. Containers by Stratum (0=Ambient, 1=Stdlib, 2=ThirdParty, 3=Workspace) ---")
+    rows = conn.execute(
+        """
+        SELECT d.stratum, d.dist_name, c.container_kind, f.module_origin_kind,
+               SUM(CASE WHEN c.is_hidden = 0 THEN 1 ELSE 0 END) AS public_cnt,
+               SUM(CASE WHEN c.is_hidden = 1 THEN 1 ELSE 0 END) AS hidden_cnt
+        FROM containers c
+        JOIN distributions d ON c.dist_id = d.dist_id
+        LEFT JOIN py_container_facets f ON c.container_id = f.container_id
+        GROUP BY d.stratum, d.dist_name, c.container_kind, f.module_origin_kind
+        ORDER BY d.stratum, c.container_kind
+        """
+    ).fetchall()
+    for stratum, dist_name, c_kind, orig_kind, pub_c, hid_c in rows:
+        print(f"  [Stratum {stratum}: {dist_name:<17}] {c_kind:<15} ({str(orig_kind):<16}) -> Public: {pub_c:>4}, Hidden: {hid_c:>4}")
+
+    print("\n--- 2. Stratum 3 Workspace Symbols (Pure-AST Harvested, Zero Execution) ---")
+    ws_rows = conn.execute(
+        """
+        SELECT s.qualified_name, s.symbol_kind, s.visibility, s.provenance,
+               COALESCE(c.raw_signature, m.declared_type_expr, m.runtime_type_name, '') AS detail,
+               s.start_line
+        FROM symbols s
+        JOIN containers con ON s.container_id = con.container_id
+        JOIN distributions d ON con.dist_id = d.dist_id
+        LEFT JOIN callables c ON s.symbol_id = c.symbol_id
+        LEFT JOIN state_members m ON s.symbol_id = m.symbol_id
+        WHERE d.stratum = 3
+        ORDER BY con.qualified_name, s.start_line, s.name
+        LIMIT 30
+        """
+    ).fetchall()
+    if not ws_rows:
+        print("  (No Stratum 3 workspace harvested in this run. Pass --workspace <dir> or --demo-workspace)")
+    for qname, skind, vis, prov, detail, sline in ws_rows:
+        loc = f"L{sline:<3}" if sline else "L?  "
+        print(f"  {loc} {qname:<42} | {skind:<11} | {vis:<16} | {prov:<20} | {detail}")
+
+    print("\n--- 3. Stratum 3 Workspace Import & Re-Export Graph (`symbol_aliases`) ---")
+    ws_aliases = conn.execute(
+        """
+        SELECT con.qualified_name, a.exposed_name, a.target_module_name, a.target_symbol_name, a.alias_kind, a.is_in_dunder_all
+        FROM symbol_aliases a
+        JOIN containers con ON a.source_container_id = con.container_id
+        JOIN distributions d ON con.dist_id = d.dist_id
+        WHERE d.stratum = 3
+        ORDER BY con.qualified_name, a.exposed_name
+        """
+    ).fetchall()
+    for src_mod, exp_name, tgt_mod, tgt_sym, akind, in_all in ws_aliases:
+        all_badge = " [in __all__]" if in_all else ""
+        print(f"  {src_mod:<28} exposes `{exp_name:<18}` -> {tgt_mod}.{tgt_sym:<18} ({akind}{all_badge})")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Clean-room Python Spectrum Harvester (Strata 0–3 + Static .pyi Overlay)."
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=Path("python_spectrum_catalog.db"),
+        help="Output SQLite database path (default: ./python_spectrum_catalog.db).",
+    )
+    parser.add_argument(
+        "--stdlib-modules",
+        nargs="*",
+        help="Optional subset of stdlib modules to harvest (omit to harvest all top-level stdlib + builtin + `_` modules).",
+    )
+    parser.add_argument(
+        "--include-submodules",
+        action="store_true",
+        help="Also walk submodules of stdlib packages.",
+    )
+    parser.add_argument(
+        "--third-party",
+        nargs="*",
+        help="Optional list of installed third-party packages to harvest.",
+    )
+    parser.add_argument(
+        "--typeshed-dir",
+        type=Path,
+        default=None,
+        help="Optional path to a local typeshed directory.",
+    )
+    parser.add_argument(
+        "--demo-stubs",
+        action="store_true",
+        help="Apply the embedded mini-typeshed overlay (builtins, sys, os).",
+    )
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Path to a local Python project/workspace directory to scan into Stratum 3 via pure AST.",
+    )
+    parser.add_argument(
+        "--workspace-name",
+        type=str,
+        default=None,
+        help="Optional logical distribution name for --workspace.",
+    )
+    parser.add_argument(
+        "--demo-workspace",
+        action="store_true",
+        help="Create and harvest an embedded multi-file Python workspace in a temporary directory to test Stratum 3.",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Drop and recreate all tables before harvesting.",
+    )
+    args = parser.parse_args(argv)
+
+    conn = sqlite3.connect(str(args.db))
+    cataloger = PythonSpectrumCataloger(conn)
+    cataloger.init_db(reset=args.reset)
+    cataloger.register_environment()
+
+    print("[1/5] Harvesting Stratum 0: Ambient Scope (Keywords, Builtins, Site-Builtins, Implicit Dunders)...")
+    cataloger.harvest_stratum_0_ambient()
+
+    print("[2/5] Harvesting Stratum 1: Versioned Python Stdlib (Public & Hidden `_` Modules)...")
+    mod_filter = set(args.stdlib_modules) if args.stdlib_modules else None
+    cataloger.harvest_stratum_1_stdlib(module_filter=mod_filter, include_submodules=args.include_submodules)
+
+    print("[3/5] Harvesting Stratum 2: Environment Third-Party Distributions...")
+    tp_filter = set(args.third_party) if args.third_party is not None else set()
+    cataloger.harvest_stratum_2_third_party(target_packages=tp_filter)
+
+    print("[4/5] Running Pass 4: Static .pyi (Typeshed) AST Overlay...")
+    overlay = StaticPyiOverlayCataloger(conn)
+    if args.demo_stubs:
+        overlay.overlay_embedded_demo_stubs()
+    elif args.typeshed_dir and args.typeshed_dir.is_dir():
+        overlay.overlay_from_directory(args.typeshed_dir, module_filter=mod_filter)
+    else:
+        discovered = overlay.auto_discover_typeshed_dirs()
+        if discovered:
+            overlay.overlay_from_directory(discovered[0], module_filter=mod_filter)
+        else:
+            overlay.overlay_embedded_demo_stubs()
+
+    print("[5/5] Harvesting Stratum 3: Local Workspace / Project (Pure AST, Zero Execution)...")
+    ws_cataloger = WorkspaceAstCataloger(cataloger)
+    if args.workspace and args.workspace.is_dir():
+        ws_cataloger.harvest_workspace(args.workspace, project_name=args.workspace_name)
+        print(
+            f"      Workspace stats: {ws_cataloger.files_scanned} .py files parsed, "
+            f"{ws_cataloger.classes_found} classes, {ws_cataloger.callables_found} callables, "
+            f"{ws_cataloger.init_attrs_synthesized} `self.<attr>` fields synthesized from __init__, "
+            f"{ws_cataloger.imports_recorded} imports linked."
+        )
+    elif args.demo_workspace:
+        with tempfile.TemporaryDirectory(prefix="spectrum_demo_ws_") as tmp_dir:
+            tmp_root = Path(tmp_dir) / "commerce_workspace"
+            for rel_path, content in EMBEDDED_DEMO_WORKSPACE_FILES.items():
+                dest = tmp_root / rel_path
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content.strip() + "\n", encoding="utf-8")
+            ws_cataloger.harvest_workspace(tmp_root, project_name="commerce-workspace", project_version="0.4.0")
+            print(
+                f"      Demo Workspace stats: {ws_cataloger.files_scanned} .py files parsed, "
+                f"{ws_cataloger.classes_found} classes, {ws_cataloger.callables_found} callables, "
+                f"{ws_cataloger.init_attrs_synthesized} `self.<attr>` fields synthesized from __init__, "
+                f"{ws_cataloger.imports_recorded} imports linked."
+            )
+
+    print_spectrum_report(conn, args.db)
+    conn.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

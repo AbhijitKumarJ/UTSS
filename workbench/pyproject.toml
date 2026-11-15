@@ -1,0 +1,18 @@
+[project]
+name = "utss-workbench"
+version = "0.1.0"
+description = "UTSS Universal Language Analysis, Synthesis & Transpiler Workbench"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.162.5",
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+    "pyyaml>=6.0.3",
+    "uvicorn>=0.54.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+

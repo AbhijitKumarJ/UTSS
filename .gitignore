@@ -1,0 +1,47 @@
+archive/
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+.venv/
+**/.venv/
+typeshed/
+**/typeshed/
+
+# .NET / C#
+**/bin/
+**/obj/
+*.user
+*.suo
+
+# Rust / Cargo
+**/target/
+Cargo.lock
+
+# TypeScript / Node / Vite
+**/node_modules/
+**/dist/
+*.tsbuildinfo
+.npm/
+
+# C / C++
+*.o
+*.a
+*.so
+**/bin/test_utss
+**/bin/utss-cpp
+
+# Go
+**/bin/utss-go
+
+# SQLite Databases (generated locally by harvesters)
+*.db
+**/*.db
+*.db-wal
+*.db-shm
+*.tmp
+*.g.cs.test
