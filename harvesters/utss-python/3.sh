@@ -24,6 +24,13 @@ else
     echo "[Typeshed] Local typeshed not found; will fallback to built-in embedded demo stubs."
 fi
 
+if command -v uv >/dev/null 2>&1; then
+    UTSS_BIN="uv run utss"
+else
+    export PYTHONPATH=src
+    UTSS_BIN="python3 -m utss.cli"
+fi
+
 # ------------------------------------------------------------------------------
 # PROFILE A: Recommended Tier-1 Synthesis Catalog (Curated Stdlib + Workspace)
 # ------------------------------------------------------------------------------
@@ -33,7 +40,7 @@ echo " PROFILE A: Recommended Synthesis Catalog (Curated Tier-1 Stdlib + Workspa
 echo " Database: catalog_synthesis.db"
 echo "------------------------------------------------------------------------------"
 
-uv run utss harvest \
+$UTSS_BIN harvest \
     --db catalog_synthesis.db \
     --stdlib-modules \
         sys os io json math time datetime pathlib \
@@ -45,15 +52,15 @@ uv run utss harvest \
 
 echo ""
 echo "[Profile A Diagnostics] Workspace AST Symbols & Coordinates (Query F):"
-uv run utss query --db catalog_synthesis.db --workspace-symbols
+$UTSS_BIN query --db catalog_synthesis.db --workspace-symbols
 
 echo ""
 echo "[Profile A Diagnostics] Generator Functions (yield) & Coroutines (async def) (Query G):"
-uv run utss query --db catalog_synthesis.db --workspace-generators
+$UTSS_BIN query --db catalog_synthesis.db --workspace-generators
 
 echo ""
 echo "[Profile A Diagnostics] Workspace Import & Re-export Dependency Graph (Query H):"
-uv run utss query --db catalog_synthesis.db --workspace-imports
+$UTSS_BIN query --db catalog_synthesis.db --workspace-imports
 
 
 # ------------------------------------------------------------------------------
@@ -67,13 +74,13 @@ echo "--------------------------------------------------------------------------
 
 if [ -n "$TYPESHED_DIR" ]; then
     echo "[Profile B] Harvesting all stdlib modules + full typeshed overlay from $TYPESHED_DIR..."
-    uv run utss harvest \
+    $UTSS_BIN harvest \
         --db catalog_base_full.db \
         --typeshed-dir "$TYPESHED_DIR" \
         --reset
 else
     echo "[Profile B] Harvesting all stdlib modules with embedded demo stubs..."
-    uv run utss harvest \
+    $UTSS_BIN harvest \
         --db catalog_base_full.db \
         --demo-stubs \
         --reset
@@ -81,15 +88,15 @@ fi
 
 echo ""
 echo "[Profile B Diagnostics] Spectrum Report Summary:"
-uv run utss report --db catalog_base_full.db
+$UTSS_BIN report --db catalog_base_full.db
 
 echo ""
 echo "[Profile B Diagnostics] Sample Polymorphic @overload Sets (Query D):"
-uv run utss query --db catalog_base_full.db --overloads
+$UTSS_BIN query --db catalog_base_full.db --overloads
 
 echo ""
 echo "[Profile B Diagnostics] Sample Statically Enriched Callables (Query E):"
-uv run utss query --db catalog_base_full.db --pyi-enriched
+$UTSS_BIN query --db catalog_base_full.db --pyi-enriched
 
 echo ""
 echo "================================================================================"

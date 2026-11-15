@@ -4,6 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "${XDG_RUNTIME_DIR}" ]; then
+    export XDG_RUNTIME_DIR=/tmp
+fi
+export DOTNET_CLI_DO_NOT_USE_GLOBAL_MUTEX=1
+
 echo "================================================================================"
 echo "   UTSS C# / .NET HARVESTER: BASE CATALOG & SYNTHESIS PROFILES"
 echo "================================================================================"

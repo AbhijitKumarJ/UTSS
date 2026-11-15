@@ -9,6 +9,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.local/go/bin:$PATH"
+if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "${XDG_RUNTIME_DIR}" ]; then
+    export XDG_RUNTIME_DIR=/tmp
+fi
+export DOTNET_CLI_DO_NOT_USE_GLOBAL_MUTEX=1
 
 GREEN="\033[0;32m"
 BLUE="\033[0;34m"
@@ -124,7 +128,30 @@ if should_harvest "go"; then
 fi
 
 # ------------------------------------------------------------------------------
-# 7. Compile Universal Transpilation Bridge in Workbench
+# 7. Symlink All Generated Catalogs into Workbench DBS
+# ------------------------------------------------------------------------------
+echo ""
+echo -e "${BOLD}${YELLOW}>>> Symlinking All Generated Catalogs into workbench/dbs...${NC}"
+mkdir -p workbench/dbs
+(
+    cd workbench/dbs
+    ln -sf ../../harvesters/utss-python/catalog_synthesis.db python_recommended.db
+    ln -sf ../../harvesters/utss-python/catalog_base_full.db python_base_full.db
+    ln -sf ../../harvesters/utss-csharp/catalog_cs_recommended.db cs_recommended.db
+    ln -sf ../../harvesters/utss-csharp/catalog_cs_full.db cs_base_full.db
+    ln -sf ../../harvesters/utss-rust/catalog_rust_recommended.db rust_recommended.db
+    ln -sf ../../harvesters/utss-rust/catalog_rust_full.db rust_base_full.db
+    ln -sf ../../harvesters/utss-typescript/catalog_ts_recommended.db ts_recommended.db
+    ln -sf ../../harvesters/utss-typescript/catalog_ts_full.db ts_full.db
+    ln -sf ../../harvesters/utss-cpp/catalog_cpp_recommended.db cpp_recommended.db
+    ln -sf ../../harvesters/utss-cpp/catalog_cpp_full.db cpp_full.db
+    ln -sf ../../harvesters/utss-go/catalog_go_recommended.db go_recommended.db
+    ln -sf ../../harvesters/utss-go/catalog_go_full.db go_full.db
+)
+echo -e "${GREEN}✓ Workbench database symlinks verified.${NC}"
+
+# ------------------------------------------------------------------------------
+# 8. Compile Universal Transpilation Bridge in Workbench
 # ------------------------------------------------------------------------------
 echo ""
 echo -e "${BOLD}${YELLOW}>>> Compiling Universal Transpilation Bridge (utss_universal_bridge.db)...${NC}"
